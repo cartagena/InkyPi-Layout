@@ -1,0 +1,629 @@
+{#
+    canvas_w/canvas_h reflect this device's real, orientation-adjusted
+    resolution when this template is rendered inside plugin.html's normal
+    context (resolution/config are shared via Jinja's {% include %}, no
+    extra plumbing needed) and fall back to the documented 800x480 default
+    otherwise (e.g. a template unit test rendering this partial directly).
+    Region x/y/w/h stay plain pixels against this coordinate space — see
+    layout.py's generate_image, which validates against the same real
+    resolution authoritatively.
+#}
+{% set canvas_res = resolution | default([800, 480]) %}
+{% set canvas_orientation = config.get('orientation', 'horizontal') if config is defined and config else 'horizontal' %}
+{% set canvas_w = canvas_res[1] if canvas_orientation == 'vertical' else canvas_res[0] %}
+{% set canvas_h = canvas_res[0] if canvas_orientation == 'vertical' else canvas_res[1] %}
+
+<div class="form-group">
+    <span style="color: var(--text-primary);">
+        Define rectangular regions on the {{ canvas_w }}x{{ canvas_h }} canvas and assign an
+        existing plugin to each one. Presets below pre-fill the region list — the mechanism
+        itself supports any combination of installed plugins.
+    </span>
+</div>
+
+<div class="form-group">
+    <label class="form-label">Presets</label>
+    <div id="layout-presets" style="display:flex; gap:8px; flex-wrap: wrap;"></div>
+</div>
+
+<div class="form-group">
+    <label class="form-label">Canvas</label>
+    <div id="layout-canvas" style="position:relative; width:100%; max-width:{{ canvas_w }}px; aspect-ratio:{{ canvas_w }}/{{ canvas_h }}; background:#fafafa; border:1px solid #ccc; overflow:hidden;"></div>
+    <small style="color: var(--text-primary);">Drag a region to move it, or drag its bottom-right corner to resize. The X/Y/W/H fields below stay in sync for precise values.</small>
+</div>
+
+<div id="layout-regions"></div>
+
+<div class="form-group">
+    <button type="button" id="layout-add-region" class="form-input" style="cursor:pointer; width:auto; padding: 6px 14px;">+ Add Region</button>
+</div>
+
+<div class="form-group">
+    <span id="layout-validation-error" style="color: #D32F2F;"></span>
+</div>
+
+<textarea name="regionsJson" id="regionsJson" style="display:none;"></textarea>
+
+<script>
+document.addEventListener('DOMContentLoaded', () => {
+    const CANVAS_W = {{ canvas_w | tojson }};
+    const CANVAS_H = {{ canvas_h | tojson }};
+    const availablePlugins = {{ available_plugins | tojson }};
+    const presets = {{ presets_json | safe }};
+    const presetLabels = {{ preset_labels | tojson }};
+
+    const container = document.getElementById('layout-regions');
+    const hiddenField = document.getElementById('regionsJson');
+    const errorEl = document.getElementById('layout-validation-error');
+    const presetContainer = document.getElementById('layout-presets');
+    const canvasEl = document.getElementById('layout-canvas');
+    const CANVAS_COLORS = ['#1976D2', '#D32F2F', '#388E3C', '#F57C00', '#7B1FA2', '#00838F', '#C2185B', '#5D4037'];
+
+    let regions = [];
+
+    function pluginOptionsHtml(selected) {
+        return availablePlugins.map(p =>
+            `<option value="${p.id}" ${p.id === selected ? 'selected' : ''}>${p.display_name}</option>`
+        ).join('');
+    }
+
+    function renderRegions() {
+        container.innerHTML = '';
+        regions.forEach((region, index) => {
+            const uid = uidFor(region);
+            const row = document.createElement('div');
+            row.className = 'settings-card';
+            row.style.marginBottom = '12px';
+            row.style.padding = '10px';
+            const refreshVal = (region.refresh_minutes === null || region.refresh_minutes === undefined) ? '' : region.refresh_minutes;
+            row.innerHTML = `
+                <div class="form-group nowrap" style="display:flex; gap:8px; align-items:flex-end; flex-wrap: wrap;">
+                    <div class="form-group">
+                        <label class="form-label">Plugin</label>
+                        <select class="form-input layout-plugin-select" data-index="${index}">
+                            ${pluginOptionsHtml(region.plugin_id)}
+                        </select>
+                    </div>
+                    <div class="form-group"><label class="form-label">X</label><input type="number" class="form-input layout-field" data-index="${index}" data-key="x" value="${region.x}" style="width:80px;"></div>
+                    <div class="form-group"><label class="form-label">Y</label><input type="number" class="form-input layout-field" data-index="${index}" data-key="y" value="${region.y}" style="width:80px;"></div>
+                    <div class="form-group"><label class="form-label">W</label><input type="number" class="form-input layout-field" data-index="${index}" data-key="w" value="${region.w}" style="width:80px;"></div>
+                    <div class="form-group"><label class="form-label">H</label><input type="number" class="form-input layout-field" data-index="${index}" data-key="h" value="${region.h}" style="width:80px;"></div>
+                    <div class="form-group"><label class="form-label">Refresh (min, optional)</label><input type="number" class="form-input layout-field" data-index="${index}" data-key="refresh_minutes" value="${refreshVal}" style="width:150px;" placeholder="always"></div>
+                    <button type="button" class="layout-remove-region" data-index="${index}" style="cursor:pointer;">Remove</button>
+                </div>
+                <div class="form-group layout-settings-container" data-uid="${uid}" data-index="${index}">
+                    <span class="layout-settings-loading" style="color: var(--text-primary);">Loading settings form…</span>
+                </div>
+            `;
+            container.appendChild(row);
+        });
+
+        container.querySelectorAll('.layout-plugin-select').forEach(el => {
+            el.addEventListener('change', (e) => {
+                const idx = +e.target.dataset.index;
+                const region = regions[idx];
+                region.plugin_id = e.target.value;
+                updateCanvasBox(idx);
+                refreshRegionSettingsEditor(region);
+                sync();
+            });
+        });
+        container.querySelectorAll('.layout-field').forEach(el => {
+            el.addEventListener('input', (e) => {
+                const idx = +e.target.dataset.index;
+                const key = e.target.dataset.key;
+                const val = e.target.value;
+                regions[idx][key] = val === '' ? (key === 'refresh_minutes' ? null : 0) : parseInt(val, 10);
+                updateCanvasBox(idx);
+                sync();
+            });
+        });
+        container.querySelectorAll('.layout-remove-region').forEach(el => {
+            el.addEventListener('click', (e) => {
+                regions.splice(+e.target.dataset.index, 1);
+                renderRegions();
+                sync();
+            });
+        });
+
+        renderCanvas();
+        regions.forEach(region => refreshRegionSettingsEditor(region));
+    }
+
+    // ---- Region settings editor: real plugin form instead of raw JSON ----
+    //
+    // Fetches the target plugin's own settings page (the same route the
+    // "Plugins" section uses — no new backend endpoint) and repurposes its
+    // rendered `[data-settings-schema]` markup in place of a hand-typed JSON
+    // textarea, so region settings get real inputs, labels, and validation
+    // hints instead of "guess the shape of the JSON." Only field/row/callout
+    // items are supported; `[data-hybrid-widget]` sections (e.g. weather's
+    // map picker) are stripped and fall back to a small "Advanced settings"
+    // JSON textarea scoped to just those leftover keys, since their JS
+    // (plugin_schema.js's widget initializers) assumes exactly one copy per
+    // page and can't safely run N times here. Plugins with no schema at all
+    // keep today's single whole-region JSON textarea, unchanged.
+    //
+    // Every id/name in the fetched fragment gets namespaced per region (see
+    // namespaceFragment) so two regions targeting the same plugin don't
+    // collide; a stable per-region uid (not array index) both drives that
+    // namespacing and lets an in-flight fetch find the right DOM container
+    // (or safely no-op) even if regions were reordered/removed while it was
+    // in flight.
+
+    const regionUids = new WeakMap();
+    let nextUid = 1;
+    function uidFor(region) {
+        if (!regionUids.has(region)) regionUids.set(region, nextUid++);
+        return regionUids.get(region);
+    }
+
+    const pluginPageCache = new Map(); // plugin_id -> Promise<Document|null>
+    function fetchPluginPage(pluginId) {
+        if (!pluginPageCache.has(pluginId)) {
+            pluginPageCache.set(pluginId, fetch('/plugin/' + encodeURIComponent(pluginId))
+                .then(resp => (resp.ok ? resp.text() : null))
+                .then(html => (html ? new DOMParser().parseFromString(html, 'text/html') : null))
+                .catch(() => null));
+        }
+        return pluginPageCache.get(pluginId);
+    }
+
+    function findSettingsContainer(uid) {
+        return container.querySelector(`.layout-settings-container[data-uid="${uid}"]`);
+    }
+
+    // Guards against a slow/late fetch overwriting a newer one for the same
+    // region (e.g. the user switches plugins twice in quick succession).
+    const regionRenderToken = new Map(); // uid -> token
+
+    async function refreshRegionSettingsEditor(region) {
+        const uid = uidFor(region);
+        const token = (regionRenderToken.get(uid) || 0) + 1;
+        regionRenderToken.set(uid, token);
+
+        const pluginId = region.plugin_id;
+        if (!pluginId) {
+            const el = findSettingsContainer(uid);
+            if (el) renderJsonFallback(el, region, 'Select a plugin above to configure its settings.');
+            return;
+        }
+
+        const doc = await fetchPluginPage(pluginId);
+        if (regionRenderToken.get(uid) !== token) return; // superseded by a later call
+
+        const el = findSettingsContainer(uid);
+        if (!el) return; // region's row is no longer in the DOM
+
+        const schemaRoot = doc ? doc.querySelector('[data-settings-schema]') : null;
+        if (!doc) {
+            renderJsonFallback(el, region, "Couldn't load this plugin's settings form; edit as JSON.");
+        } else if (!schemaRoot) {
+            renderJsonFallback(el, region, 'This plugin has no settings form; edit as JSON.');
+        } else {
+            buildSchemaEditor(el, region, uid, schemaRoot);
+        }
+    }
+
+    function renderJsonFallback(containerEl, region, label) {
+        containerEl.innerHTML = '';
+        const labelEl = document.createElement('label');
+        labelEl.className = 'form-label';
+        labelEl.textContent = label;
+        const textarea = document.createElement('textarea');
+        textarea.className = 'form-input layout-settings-json';
+        textarea.rows = 3;
+        textarea.value = JSON.stringify(region.settings || {}, null, 2);
+        textarea.addEventListener('input', () => {
+            try {
+                region.settings = JSON.parse(textarea.value || '{}');
+                textarea.style.borderColor = '';
+            } catch (err) {
+                textarea.style.borderColor = '#D32F2F';
+            }
+            sync();
+        });
+        containerEl.appendChild(labelEl);
+        containerEl.appendChild(textarea);
+    }
+
+    function stripWidgets(fragment) {
+        fragment.querySelectorAll('[data-hybrid-widget]').forEach(el => el.remove());
+    }
+
+    // The checkbox macro emits a hidden mirror input sharing the visible
+    // checkbox's `name`, purely so a *native* form submission still sends an
+    // explicit "unchecked" value. We read values via JS, not native
+    // submission, so the mirror only risks making one field name resolve to
+    // two elements — drop it.
+    function stripCheckboxMirrors(fragment) {
+        fragment.querySelectorAll('.toggle-item > input[type="hidden"]').forEach(el => el.remove());
+    }
+
+    // Namespaces every id/name in the fragment so N copies (one per region)
+    // can coexist on one page without colliding, while stamping each
+    // element's original field name onto data-field-name first so
+    // region.settings keys stay correct regardless of the rewritten name/id.
+    function namespaceFragment(fragment, uid) {
+        fragment.querySelectorAll('[name]').forEach(el => {
+            if (!el.dataset.fieldName) el.dataset.fieldName = el.getAttribute('name');
+        });
+
+        const idMap = {};
+        fragment.querySelectorAll('[id]').forEach(el => {
+            const oldId = el.getAttribute('id');
+            const newId = `region-${uid}-${oldId}`;
+            idMap[oldId] = newId;
+            el.setAttribute('id', newId);
+        });
+
+        fragment.querySelectorAll('[name]').forEach(el => {
+            el.setAttribute('name', `region-${uid}-${el.getAttribute('name')}`);
+        });
+        fragment.querySelectorAll('[for]').forEach(el => {
+            const target = idMap[el.getAttribute('for')];
+            if (target) el.setAttribute('for', target);
+        });
+        fragment.querySelectorAll('[list]').forEach(el => {
+            const target = idMap[el.getAttribute('list')];
+            if (target) el.setAttribute('list', target);
+        });
+        fragment.querySelectorAll('[aria-describedby]').forEach(el => {
+            const target = idMap[el.getAttribute('aria-describedby')];
+            if (target) el.setAttribute('aria-describedby', target);
+        });
+    }
+
+    function collectFieldNames(fragment) {
+        const names = [];
+        fragment.querySelectorAll('[data-field-name]').forEach(el => {
+            if (!names.includes(el.dataset.fieldName)) names.push(el.dataset.fieldName);
+        });
+        return names;
+    }
+
+    function elementsForField(fragment, fieldName) {
+        return Array.from(fragment.querySelectorAll('[data-field-name]'))
+            .filter(el => el.dataset.fieldName === fieldName);
+    }
+
+    function getFieldValue(fragment, fieldName) {
+        const els = elementsForField(fragment, fieldName);
+        if (!els.length) return undefined;
+        if (els[0].type === 'radio') {
+            const checked = els.find(el => el.checked);
+            return checked ? checked.value : undefined;
+        }
+        const el = els[0];
+        if (el.type === 'checkbox') {
+            return el.checked ? (el.dataset.checkedValue ?? 'true') : (el.dataset.uncheckedValue ?? 'false');
+        }
+        return el.value;
+    }
+
+    function setFieldValue(fragment, fieldName, value) {
+        const els = elementsForField(fragment, fieldName);
+        if (!els.length) return;
+        if (els[0].type === 'radio') {
+            els.forEach(el => { el.checked = (String(el.value) === String(value)); });
+            return;
+        }
+        const el = els[0];
+        if (el.type === 'checkbox') {
+            const checkedValue = el.dataset.checkedValue ?? 'true';
+            el.checked = (String(value) === String(checkedValue));
+            return;
+        }
+        el.value = (value === undefined || value === null) ? '' : value;
+    }
+
+    // Mirrors settings_schema.html's is_visible macro.
+    function evaluateVisibility(fragment, el) {
+        const fieldName = el.dataset.visibleIfField;
+        if (!fieldName) return true;
+        const operator = el.dataset.visibleIfOperator || 'equals';
+        const actual = String(getFieldValue(fragment, fieldName) ?? '');
+        if (operator === 'not_equals') return actual !== String(el.dataset.visibleIfEquals ?? '');
+        if (operator === 'not_empty') return actual.trim() !== '';
+        if (operator === 'in') {
+            let values = [];
+            try { values = JSON.parse(el.dataset.visibleIfValues || '[]'); } catch (err) { /* treat as empty */ }
+            return values.map(String).includes(actual);
+        }
+        return actual === String(el.dataset.visibleIfEquals ?? '');
+    }
+
+    function applyVisibility(fragment) {
+        fragment.querySelectorAll('[data-visible-if-field]').forEach(el => {
+            el.hidden = !evaluateVisibility(fragment, el);
+        });
+    }
+
+    function buildOptionsFragment(options, selectedValue) {
+        const frag = document.createDocumentFragment();
+        (options || []).forEach(opt => {
+            if (!opt) return;
+            if (opt.kind === 'option_group') {
+                const group = document.createElement('optgroup');
+                group.label = opt.label;
+                (opt.options || []).forEach(child => {
+                    const o = document.createElement('option');
+                    o.value = child.value;
+                    o.textContent = child.label;
+                    o.selected = String(selectedValue) === String(child.value);
+                    group.appendChild(o);
+                });
+                frag.appendChild(group);
+            } else {
+                const o = document.createElement('option');
+                o.value = opt.value;
+                o.textContent = opt.label;
+                o.selected = String(selectedValue) === String(opt.value);
+                frag.appendChild(o);
+            }
+        });
+        return frag;
+    }
+
+    // Mirrors settings_schema.html's field.options_by_value: a select whose
+    // option list depends on another field's current value.
+    function applyDependentOptions(fragment) {
+        fragment.querySelectorAll('select[data-options-source-field]').forEach(select => {
+            const sourceValue = String(getFieldValue(fragment, select.dataset.optionsSourceField) ?? '');
+            let optionsMap = {};
+            let fallbackOptions = [];
+            try { optionsMap = JSON.parse(select.dataset.optionsMap || '{}'); } catch (err) { /* keep empty */ }
+            try { fallbackOptions = JSON.parse(select.dataset.fallbackOptions || '[]'); } catch (err) { /* keep empty */ }
+            const options = Object.prototype.hasOwnProperty.call(optionsMap, sourceValue)
+                ? optionsMap[sourceValue]
+                : fallbackOptions;
+            const currentValue = getFieldValue(fragment, select.dataset.fieldName) ?? select.dataset.currentValue ?? '';
+            select.innerHTML = '';
+            select.appendChild(buildOptionsFragment(options, currentValue));
+        });
+    }
+
+    function buildSchemaEditor(containerEl, region, uid, schemaRoot) {
+        const fragment = schemaRoot.cloneNode(true);
+        stripWidgets(fragment);
+        stripCheckboxMirrors(fragment);
+        namespaceFragment(fragment, uid);
+
+        const fieldNames = collectFieldNames(fragment);
+        region.settings = region.settings || {};
+
+        fieldNames.forEach(name => {
+            if (Object.prototype.hasOwnProperty.call(region.settings, name)) {
+                setFieldValue(fragment, name, region.settings[name]);
+            }
+        });
+        applyDependentOptions(fragment);
+        applyVisibility(fragment);
+
+        fragment.addEventListener('input', handleFieldChange);
+        fragment.addEventListener('change', handleFieldChange);
+        function handleFieldChange(e) {
+            const target = e.target;
+            if (!target || !target.dataset || !target.dataset.fieldName) return;
+            region.settings[target.dataset.fieldName] = getFieldValue(fragment, target.dataset.fieldName);
+            applyDependentOptions(fragment);
+            applyVisibility(fragment);
+            sync();
+        }
+
+        const advancedWrap = document.createElement('div');
+        advancedWrap.className = 'form-group';
+        const advancedLabel = document.createElement('label');
+        advancedLabel.className = 'form-label';
+        advancedLabel.textContent = 'Advanced settings (JSON — for anything not shown above, e.g. a map or repeater picker)';
+        const advancedTextarea = document.createElement('textarea');
+        advancedTextarea.className = 'form-input layout-settings-json-advanced';
+        advancedTextarea.rows = 2;
+        const leftover = {};
+        Object.keys(region.settings).forEach(key => {
+            if (!fieldNames.includes(key)) leftover[key] = region.settings[key];
+        });
+        advancedTextarea.value = JSON.stringify(leftover, null, 2);
+        advancedTextarea.addEventListener('input', () => {
+            try {
+                const parsed = JSON.parse(advancedTextarea.value || '{}');
+                Object.keys(region.settings).forEach(key => {
+                    if (!fieldNames.includes(key)) delete region.settings[key];
+                });
+                Object.assign(region.settings, parsed);
+                advancedTextarea.style.borderColor = '';
+            } catch (err) {
+                advancedTextarea.style.borderColor = '#D32F2F';
+            }
+            sync();
+        });
+        advancedWrap.appendChild(advancedLabel);
+        advancedWrap.appendChild(advancedTextarea);
+
+        containerEl.innerHTML = '';
+        containerEl.appendChild(fragment);
+        containerEl.appendChild(advancedWrap);
+    }
+
+    function clampInt(value, min, max) {
+        return Math.max(min, Math.min(max, Math.round(value)));
+    }
+
+    function boxStyleFor(region) {
+        const w = Math.max(region.w, 1);
+        const h = Math.max(region.h, 1);
+        return {
+            left: (region.x / CANVAS_W * 100) + '%',
+            top: (region.y / CANVAS_H * 100) + '%',
+            width: (w / CANVAS_W * 100) + '%',
+            height: (h / CANVAS_H * 100) + '%',
+        };
+    }
+
+    // Updates one region's canvas box position/size/label and its X/Y/W/H
+    // number inputs, without rebuilding either DOM tree. Used both while
+    // dragging on the canvas and after editing a number input directly, so
+    // the two controls always agree. Skips writing into whichever number
+    // input the user is actively typing in so it doesn't fight their input.
+    function updateCanvasBox(index) {
+        const region = regions[index];
+        const box = canvasEl.querySelector(`.layout-canvas-box[data-index="${index}"]`);
+        if (box) {
+            const style = boxStyleFor(region);
+            box.style.left = style.left;
+            box.style.top = style.top;
+            box.style.width = style.width;
+            box.style.height = style.height;
+            const label = box.querySelector('.layout-canvas-label');
+            if (label) label.textContent = region.plugin_id || `Region ${index + 1}`;
+        }
+
+        container.querySelectorAll(`.layout-field[data-index="${index}"]`).forEach(input => {
+            const key = input.dataset.key;
+            if (key === 'refresh_minutes' || document.activeElement === input) return;
+            input.value = region[key];
+        });
+    }
+
+    function renderCanvas() {
+        canvasEl.innerHTML = '';
+        regions.forEach((region, index) => {
+            const color = CANVAS_COLORS[index % CANVAS_COLORS.length];
+            const style = boxStyleFor(region);
+
+            const box = document.createElement('div');
+            box.className = 'layout-canvas-box';
+            box.dataset.index = index;
+            box.title = 'Drag to move';
+            box.style.cssText = `position:absolute; box-sizing:border-box; left:${style.left}; top:${style.top}; width:${style.width}; height:${style.height}; border:2px solid ${color}; background:${color}22; cursor:move; overflow:hidden; touch-action:none;`;
+
+            const label = document.createElement('div');
+            label.className = 'layout-canvas-label';
+            label.textContent = region.plugin_id || `Region ${index + 1}`;
+            label.style.cssText = `font-size:11px; padding:2px 4px; color:#fff; background:${color}; display:inline-block; max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; pointer-events:none;`;
+            box.appendChild(label);
+
+            const handle = document.createElement('div');
+            handle.className = 'layout-canvas-resize-handle';
+            handle.title = 'Drag to resize';
+            handle.style.cssText = `position:absolute; right:0; bottom:0; width:14px; height:14px; cursor:nwse-resize; background:${color}; opacity:0.9; touch-action:none;`;
+            box.appendChild(handle);
+
+            box.addEventListener('pointerdown', (e) => startDrag(e, index, 'move'));
+            handle.addEventListener('pointerdown', (e) => {
+                e.stopPropagation();
+                startDrag(e, index, 'resize');
+            });
+
+            canvasEl.appendChild(box);
+        });
+    }
+
+    // Drags (mode 'move') or resizes (mode 'resize') region `index` on the
+    // canvas. Pointer client-coordinate deltas are scaled from the canvas
+    // element's actual rendered size back into the fixed CANVAS_W x
+    // CANVAS_H coordinate space so this works regardless of how the
+    // (responsive, CSS-scaled) canvas is currently displayed.
+    function startDrag(e, index, mode) {
+        e.preventDefault();
+        const region = regions[index];
+        const canvasRect = canvasEl.getBoundingClientRect();
+        if (!canvasRect.width || !canvasRect.height) return;
+        const scaleX = CANVAS_W / canvasRect.width;
+        const scaleY = CANVAS_H / canvasRect.height;
+        const startClientX = e.clientX;
+        const startClientY = e.clientY;
+        const start = { x: region.x, y: region.y, w: region.w, h: region.h };
+        const target = e.currentTarget;
+        target.setPointerCapture(e.pointerId);
+
+        function onMove(ev) {
+            const dx = (ev.clientX - startClientX) * scaleX;
+            const dy = (ev.clientY - startClientY) * scaleY;
+            if (mode === 'move') {
+                region.x = clampInt(start.x + dx, 0, Math.max(0, CANVAS_W - region.w));
+                region.y = clampInt(start.y + dy, 0, Math.max(0, CANVAS_H - region.h));
+            } else {
+                region.w = clampInt(start.w + dx, 1, CANVAS_W - region.x);
+                region.h = clampInt(start.h + dy, 1, CANVAS_H - region.y);
+            }
+            updateCanvasBox(index);
+            sync();
+        }
+
+        function onUp(ev) {
+            target.releasePointerCapture(ev.pointerId);
+            target.removeEventListener('pointermove', onMove);
+            target.removeEventListener('pointerup', onUp);
+            target.removeEventListener('pointercancel', onUp);
+        }
+
+        target.addEventListener('pointermove', onMove);
+        target.addEventListener('pointerup', onUp);
+        target.addEventListener('pointercancel', onUp);
+    }
+
+    function validate() {
+        const errors = [];
+        regions.forEach((r, i) => {
+            if (!r.plugin_id) errors.push(`Region ${i + 1}: no plugin selected.`);
+            if (!(r.w > 0) || !(r.h > 0)) errors.push(`Region ${i + 1}: width/height must be positive.`);
+            if (r.x < 0 || r.y < 0) errors.push(`Region ${i + 1}: x/y must not be negative.`);
+            if (r.x + r.w > CANVAS_W || r.y + r.h > CANVAS_H) {
+                errors.push(`Region ${i + 1} (${r.plugin_id}) exceeds the ${CANVAS_W}x${CANVAS_H} canvas.`);
+            }
+        });
+        errorEl.textContent = errors.join(' ');
+        return errors.length === 0;
+    }
+
+    function sync() {
+        hiddenField.value = JSON.stringify(regions);
+        validate();
+    }
+
+    document.getElementById('layout-add-region').addEventListener('click', () => {
+        regions.push({
+            plugin_id: availablePlugins.length ? availablePlugins[0].id : '',
+            x: 0, y: 0, w: 100, h: 100, settings: {}, refresh_minutes: null,
+        });
+        renderRegions();
+        sync();
+    });
+
+    presetLabels.forEach(p => {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.textContent = p.label;
+        btn.className = 'form-input';
+        btn.style.cursor = 'pointer';
+        btn.style.width = 'auto';
+        btn.style.padding = '6px 14px';
+        btn.addEventListener('click', () => {
+            regions = JSON.parse(JSON.stringify(presets[p.key]));
+            renderRegions();
+            sync();
+        });
+        presetContainer.appendChild(btn);
+    });
+
+    if (typeof loadPluginSettings !== 'undefined' && loadPluginSettings && pluginSettings.regionsJson) {
+        try {
+            regions = JSON.parse(pluginSettings.regionsJson);
+        } catch (e) {
+            regions = [];
+        }
+    }
+    renderRegions();
+    sync();
+
+    // Defense-in-depth: block submission client-side too (generate_image and
+    // validate_settings are the authoritative server-side checks).
+    document.addEventListener('submit', (e) => {
+        if (!validate()) {
+            e.preventDefault();
+            e.stopPropagation();
+        }
+    }, true);
+});
+</script>
