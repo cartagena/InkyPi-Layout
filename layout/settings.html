@@ -109,6 +109,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 const idx = +e.target.dataset.index;
                 const region = regions[idx];
                 region.plugin_id = e.target.value;
+                region.settings = {}; // switching plugins — the old plugin's settings don't apply to the new one
                 updateCanvasBox(idx);
                 refreshRegionSettingsEditor(region);
                 refreshCloneOptions(region);
@@ -262,7 +263,29 @@ document.addEventListener('DOMContentLoaded', () => {
     // count so there's no dynamic-row namespacing gap). Grows as more widget
     // types are verified; anything not listed here still falls back to the
     // stripped + "use Start from existing instance" notice.
-    const LAYOUT_SUPPORTED_WIDGET_TYPES = ['github-colors', 'newspaper-search', 'clock-face-picker', 'weather-map'];
+    const LAYOUT_SUPPORTED_WIDGET_TYPES = ['github-colors', 'newspaper-search', 'clock-face-picker', 'weather-map', 'calendar-repeater', 'todo-repeater'];
+
+    // calendar-repeater/todo-repeater own array-valued fields whose row count
+    // changes at runtime (their own "Add"/remove buttons), so rows created
+    // after namespaceFragment already ran never get a data-field-name
+    // stamped — the generic data-field-name-based field system can't track
+    // them. These two field groups are collected/prefilled directly from
+    // each widget's own live subtree instead. See REPEATER_FIELD_GROUPS below.
+    const REPEATER_FIELD_GROUPS = {
+        'calendar-repeater': ['calendarURLs[]', 'calendarColors[]'],
+        'todo-repeater': ['list-title[]', 'list[]'],
+    };
+    const REPEATER_FIELD_NAMES = Object.values(REPEATER_FIELD_GROUPS).flat();
+
+    // Reads a repeater field's current values straight from the widget's own
+    // subtree: original rows carry data-field-name (stamped during
+    // namespaceFragment), rows added later via the widget's "Add" button only
+    // ever carry their original, un-namespaced `name` — this selector catches
+    // both without double-counting either.
+    function collectRepeaterValue(widget, fieldName) {
+        return Array.from(widget.querySelectorAll(`[data-field-name="${fieldName}"], [name="${fieldName}"]`))
+            .map(el => el.value);
+    }
 
     // Runs the real widget JS for any supported widget type in `fragment`,
     // scoped to this region's own settings — must happen *before*
@@ -578,8 +601,21 @@ document.addEventListener('DOMContentLoaded', () => {
 
         const fieldNames = collectFieldNames(fragment);
         region.settings = region.settings || {};
+        // A field's native 'change' can fire on blur *after* this call
+        // returns — e.g. the user is still focused in this fragment's own
+        // input when they pick a different plugin, which resets
+        // region.settings and kicks off a new render before the blur event
+        // is done propagating. Stamping the token this render was built for
+        // lets stale handlers below detect they've been superseded and
+        // no-op instead of writing a just-abandoned plugin's value back in.
+        const myRenderToken = regionRenderToken.get(uid);
 
         fieldNames.forEach(name => {
+            // Skipped here: initSupportedWidgets already seeded these arrays
+            // correctly (each row's own value) from region.settings before
+            // namespacing ran; setFieldValue only knows how to write a single
+            // element and would clobber every row but the first.
+            if (REPEATER_FIELD_NAMES.includes(name)) return;
             if (Object.prototype.hasOwnProperty.call(region.settings, name)) {
                 setFieldValue(fragment, name, region.settings[name]);
             }
@@ -589,13 +625,52 @@ document.addEventListener('DOMContentLoaded', () => {
 
         fragment.addEventListener('input', handleFieldChange);
         fragment.addEventListener('change', handleFieldChange);
+        // Capture phase: a remove click detaches its row from the DOM
+        // synchronously (inside the button's own bubble-phase listener), so
+        // by the time a bubble-phase listener here would see the event,
+        // e.target.closest() can no longer reach the widget ancestor at all.
+        // Capturing first lets us grab that reference while it's still
+        // attached, then defer the actual (post-removal) value collection.
+        fragment.addEventListener('click', handleRepeaterStructureChange, true);
         function handleFieldChange(e) {
             const target = e.target;
-            if (!target || !target.dataset || !target.dataset.fieldName) return;
+            if (!target) return;
+            if (regionRenderToken.get(uid) !== myRenderToken) return; // this fragment was superseded (e.g. plugin switched)
+            const repeaterWidget = target.closest && target.closest('[data-hybrid-widget]');
+            const repeaterType = repeaterWidget && repeaterWidget.dataset.hybridWidget;
+            if (repeaterType && REPEATER_FIELD_GROUPS[repeaterType]) {
+                const fieldName = target.dataset.fieldName || target.getAttribute('name');
+                if (fieldName && REPEATER_FIELD_GROUPS[repeaterType].includes(fieldName)) {
+                    region.settings[fieldName] = collectRepeaterValue(repeaterWidget, fieldName);
+                    sync();
+                    return;
+                }
+            }
+            if (!target.dataset || !target.dataset.fieldName) return;
             region.settings[target.dataset.fieldName] = getFieldValue(fragment, target.dataset.fieldName);
             applyDependentOptions(fragment);
             applyVisibility(fragment);
             sync();
+        }
+        // Row add/remove buttons don't fire input/change, so re-collect a
+        // repeater's arrays whenever a click lands on its own add or remove
+        // control (runs after the widget's own click handler already
+        // mutated the DOM, since this listener only sees the bubbled event).
+        function handleRepeaterStructureChange(e) {
+            const target = e.target;
+            const repeaterWidget = target.closest && target.closest('[data-hybrid-widget]');
+            const repeaterType = repeaterWidget && repeaterWidget.dataset.hybridWidget;
+            if (!repeaterType || !REPEATER_FIELD_GROUPS[repeaterType]) return;
+            if (!target.closest('.remove-btn') && !target.closest('[data-repeater-add]')) return;
+            // Runs after the widget's own bubble-phase click listener (add
+            // append / remove detach) has finished mutating the DOM.
+            setTimeout(() => {
+                if (regionRenderToken.get(uid) !== myRenderToken) return; // superseded since the click
+                REPEATER_FIELD_GROUPS[repeaterType].forEach(fieldName => {
+                    region.settings[fieldName] = collectRepeaterValue(repeaterWidget, fieldName);
+                });
+                sync();
+            }, 0);
         }
 
         const advancedWrap = document.createElement('div');
