@@ -256,8 +256,161 @@ document.addEventListener('DOMContentLoaded', () => {
         containerEl.appendChild(textarea);
     }
 
-    function stripWidgets(fragment) {
-        fragment.querySelectorAll('[data-hybrid-widget]').forEach(el => el.remove());
+    // Widget types verified safe to run for real, per-region, via iService's
+    // InkyPiPluginSchema.initWidgetsIn (root-scoped, no shared global state,
+    // seed correctly from a passed-in settings dict, fixed/non-growing input
+    // count so there's no dynamic-row namespacing gap). Grows as more widget
+    // types are verified; anything not listed here still falls back to the
+    // stripped + "use Start from existing instance" notice.
+    const LAYOUT_SUPPORTED_WIDGET_TYPES = ['github-colors', 'newspaper-search', 'clock-face-picker', 'weather-map'];
+
+    // Runs the real widget JS for any supported widget type in `fragment`,
+    // scoped to this region's own settings — must happen *before*
+    // namespaceFragment, since these initializers look up their own inputs
+    // by literal id/name. That's safe: they attach event listeners to
+    // element references, not id strings, so renaming ids afterward doesn't
+    // break anything already wired up.
+    function initSupportedWidgets(fragment, region) {
+        if (!window.InkyPiPluginSchema || !window.InkyPiPluginSchema.initWidgetsIn) return;
+        window.InkyPiPluginSchema.initWidgetsIn(fragment, region.settings || {}, LAYOUT_SUPPORTED_WIDGET_TYPES);
+    }
+
+    // Some widget templates (weather-map) embed their own <script src>/<link>
+    // tags (Leaflet) rather than assuming it's already loaded. A cloned
+    // fragment carries those tags too, and unlike innerHTML-parsed markup,
+    // a <script> inserted via appendChild/cloneNode *does* get executed by
+    // the browser — so N weather regions would otherwise each re-fetch and
+    // re-run the same library. Keep the first occurrence (so it loads
+    // normally) and drop any later one already present elsewhere on the
+    // page by the time this fragment is about to be attached.
+    // A <script> parsed by DOMParser (as every widget fragment is, via
+    // fetchPluginPage) has its "already started" flag permanently set by
+    // the HTML spec, specifically so it can never execute later — not even
+    // a network request fires, regardless of how the node is subsequently
+    // cloned or inserted into the live document. Confirmed directly: a
+    // cloned <script src="leaflet.js"> sits in the DOM indefinitely with
+    // zero fetch attempt, while <link rel=stylesheet> tags cloned the same
+    // way apply completely normally (no such restriction exists for
+    // stylesheets). So any widget-embedded script needs a genuinely new
+    // <script> element created via document.createElement — the cloned tag
+    // is always stripped, never relied on.
+    const loadedWidgetScriptUrls = new Set();
+    function loadWidgetScripts(fragment) {
+        fragment.querySelectorAll('script[src]').forEach(el => {
+            const url = el.getAttribute('src');
+            el.remove();
+            if (!url || loadedWidgetScriptUrls.has(url) || document.querySelector(`script[src="${CSS.escape(url)}"]`)) {
+                if (url) loadedWidgetScriptUrls.add(url);
+                return;
+            }
+            loadedWidgetScriptUrls.add(url);
+            const script = document.createElement('script');
+            script.src = url;
+            document.head.appendChild(script);
+        });
+    }
+
+    // <link rel=stylesheet> tags, unlike <script>, apply correctly via
+    // cloneNode + appendChild — this just avoids inserting the same
+    // stylesheet redundantly once per region.
+    function dedupeWidgetAssets(fragment) {
+        fragment.querySelectorAll('link[rel="stylesheet"][href]').forEach(el => {
+            const url = el.getAttribute('href');
+            if (url && document.querySelector(`link[rel="stylesheet"][href="${CSS.escape(url)}"]`)) {
+                el.remove();
+            }
+        });
+    }
+
+    // Only removes widget types NOT in LAYOUT_SUPPORTED_WIDGET_TYPES — a
+    // supported widget was already initialized for real above and should
+    // stay in the fragment like any other field.
+    function stripUnsupportedWidgets(fragment) {
+        fragment.querySelectorAll('[data-hybrid-widget]').forEach(el => {
+            if (!LAYOUT_SUPPORTED_WIDGET_TYPES.includes(el.dataset.hybridWidget)) el.remove();
+        });
+    }
+
+    // Sections that contain at least one [data-hybrid-widget] *before*
+    // stripUnsupportedWidgets runs. Captured up front since stripping
+    // removes the very marker needed to tell "this section had a widget
+    // stripped out of it" apart from "this section was always just
+    // informational" — no schema-driven plugin today has a field-free,
+    // widget-free section, but scoping this way means a future one
+    // wouldn't be misidentified either.
+    function findWidgetSections(fragment) {
+        const sections = new Set();
+        fragment.querySelectorAll('.schema-section').forEach(section => {
+            if (section.querySelector('[data-hybrid-widget]')) sections.add(section);
+        });
+        return sections;
+    }
+
+    function pluginDisplayName(pluginId) {
+        const match = availablePlugins.find(p => p.id === pluginId);
+        return match ? match.display_name : pluginId;
+    }
+
+    // Builds the same .settings-callout component this page's own scraped
+    // schema fragments already use for callout() items, so a stripped
+    // widget's replacement notice looks native rather than bolted-on.
+    function buildWidgetUnavailableNotice(sectionTitle, pluginId) {
+        const callout = document.createElement('div');
+        callout.className = 'settings-callout warning';
+
+        const icon = document.createElement('i');
+        icon.className = 'ph ph-warning ph-thin icon-image';
+        icon.setAttribute('aria-hidden', 'true');
+        callout.appendChild(icon);
+
+        const body = document.createElement('div');
+
+        const p1 = document.createElement('p');
+        const strong = document.createElement('strong');
+        strong.textContent = sectionTitle;
+        p1.appendChild(strong);
+        p1.appendChild(document.createTextNode(
+            " isn't available in a Layout region — it needs an interactive control that can't safely be shown more than once on this page."
+        ));
+        body.appendChild(p1);
+
+        const p2 = document.createElement('p');
+        p2.appendChild(document.createTextNode('To set it: open '));
+        const link = document.createElement('a');
+        link.href = '/plugin/' + encodeURIComponent(pluginId);
+        link.target = '_blank';
+        link.rel = 'noopener';
+        link.textContent = pluginDisplayName(pluginId) + '’s own settings page';
+        p2.appendChild(link);
+        p2.appendChild(document.createTextNode(
+            ', configure ' + sectionTitle + ' there, Add to Playlist to save it as a named instance, then come back here and pick that instance from "Start from existing instance" above.'
+        ));
+        body.appendChild(p2);
+
+        callout.appendChild(body);
+        return callout;
+    }
+
+    // Run immediately after stripUnsupportedWidgets: a captured section
+    // left with zero real fields *and* no surviving [data-hybrid-widget]
+    // (i.e. its widget was unsupported and got stripped) means the widget
+    // was either its only source of settings (e.g. calendar/image_upload's
+    // whole-section case) or its only *other* content can't stand alone
+    // without it — either way it would otherwise render as a title over an
+    // empty box. Sections whose widget is in LAYOUT_SUPPORTED_WIDGET_TYPES
+    // never reach this state — their widget survives stripping and is
+    // caught by the `[data-hybrid-widget]` skip below.
+    function replaceEmptyWidgetSections(fragment, widgetSections, pluginId) {
+        widgetSections.forEach(section => {
+            if (section.querySelector('.schema-field')) return; // still has usable fields
+            if (section.querySelector('[data-hybrid-widget]')) return; // a supported widget survived stripping — real, working content
+            const body = section.querySelector(':scope > .schema-section-body');
+            if (!body) return;
+            const titleEl = section.querySelector(':scope > .settings-card-title');
+            const title = titleEl ? titleEl.textContent.trim() : 'This section';
+            body.innerHTML = '';
+            body.appendChild(buildWidgetUnavailableNotice(title, pluginId));
+        });
     }
 
     // The checkbox macro emits a hidden mirror input sharing the visible
@@ -414,7 +567,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function buildSchemaEditor(containerEl, region, uid, schemaRoot) {
         const fragment = schemaRoot.cloneNode(true);
-        stripWidgets(fragment);
+        const widgetSections = findWidgetSections(fragment);
+        loadWidgetScripts(fragment); // kick off ASAP so it has maximum time to load before a widget needs it
+        initSupportedWidgets(fragment, region);
+        stripUnsupportedWidgets(fragment);
+        dedupeWidgetAssets(fragment);
+        replaceEmptyWidgetSections(fragment, widgetSections, region.plugin_id);
         stripCheckboxMirrors(fragment);
         namespaceFragment(fragment, uid);
 
