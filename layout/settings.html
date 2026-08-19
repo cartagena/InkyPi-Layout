@@ -34,7 +34,7 @@
 
 <div id="layout-regions"></div>
 
-<div class="form-group">
+<div class="form-group" style="position:sticky; bottom:0; background:var(--surface); border-top:1px solid var(--surface-border); padding:10px 0; z-index:5;">
     <button type="button" id="layout-add-region" class="form-input" style="cursor:pointer; width:auto; padding: 6px 14px;">+ Add Region</button>
 </div>
 
@@ -84,6 +84,12 @@ document.addEventListener('DOMContentLoaded', () => {
                             ${pluginOptionsHtml(region.plugin_id)}
                         </select>
                     </div>
+                    <div class="form-group">
+                        <label class="form-label">Start from existing instance</label>
+                        <select class="form-input layout-clone-select" data-index="${index}" data-uid="${uid}">
+                            <option value="">— choose —</option>
+                        </select>
+                    </div>
                     <div class="form-group"><label class="form-label">X</label><input type="number" class="form-input layout-field" data-index="${index}" data-key="x" value="${region.x}" style="width:80px;"></div>
                     <div class="form-group"><label class="form-label">Y</label><input type="number" class="form-input layout-field" data-index="${index}" data-key="y" value="${region.y}" style="width:80px;"></div>
                     <div class="form-group"><label class="form-label">W</label><input type="number" class="form-input layout-field" data-index="${index}" data-key="w" value="${region.w}" style="width:80px;"></div>
@@ -105,7 +111,25 @@ document.addEventListener('DOMContentLoaded', () => {
                 region.plugin_id = e.target.value;
                 updateCanvasBox(idx);
                 refreshRegionSettingsEditor(region);
+                refreshCloneOptions(region);
                 sync();
+            });
+        });
+        container.querySelectorAll('.layout-clone-select').forEach(el => {
+            el.addEventListener('change', async (e) => {
+                const idx = +e.target.dataset.index;
+                const region = regions[idx];
+                const instanceName = e.target.value;
+                e.target.value = ''; // one-shot action, not a persistent selection
+                if (!instanceName || !region.plugin_id) return;
+                const cloned = await fetchInstanceSettings(region.plugin_id, instanceName);
+                if (cloned && typeof cloned === 'object') {
+                    region.settings = cloned;
+                    refreshRegionSettingsEditor(region);
+                    sync();
+                } else {
+                    errorEl.textContent = `Couldn't load settings for "${instanceName}".`;
+                }
             });
         });
         container.querySelectorAll('.layout-field').forEach(el => {
@@ -127,7 +151,10 @@ document.addEventListener('DOMContentLoaded', () => {
         });
 
         renderCanvas();
-        regions.forEach(region => refreshRegionSettingsEditor(region));
+        regions.forEach(region => {
+            refreshRegionSettingsEditor(region);
+            refreshCloneOptions(region);
+        });
     }
 
     // ---- Region settings editor: real plugin form instead of raw JSON ----
@@ -199,7 +226,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (!doc) {
             renderJsonFallback(el, region, "Couldn't load this plugin's settings form; edit as JSON.");
         } else if (!schemaRoot) {
-            renderJsonFallback(el, region, 'This plugin has no settings form; edit as JSON.');
+            renderJsonFallback(el, region, '');
         } else {
             buildSchemaEditor(el, region, uid, schemaRoot);
         }
@@ -207,9 +234,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function renderJsonFallback(containerEl, region, label) {
         containerEl.innerHTML = '';
-        const labelEl = document.createElement('label');
-        labelEl.className = 'form-label';
-        labelEl.textContent = label;
+        if (label) {
+            const labelEl = document.createElement('label');
+            labelEl.className = 'form-label';
+            labelEl.textContent = label;
+            containerEl.appendChild(labelEl);
+        }
         const textarea = document.createElement('textarea');
         textarea.className = 'form-input layout-settings-json';
         textarea.rows = 3;
@@ -223,7 +253,6 @@ document.addEventListener('DOMContentLoaded', () => {
             }
             sync();
         });
-        containerEl.appendChild(labelEl);
         containerEl.appendChild(textarea);
     }
 
@@ -445,6 +474,151 @@ document.addEventListener('DOMContentLoaded', () => {
         containerEl.appendChild(advancedWrap);
     }
 
+    // ---- Clone settings from an existing plugin instance ----
+    //
+    // Lets a region start from a plugin instance that's already configured
+    // elsewhere (another playlist, another region) instead of being
+    // configured from scratch — a one-time copy into region.settings, not a
+    // live link, so it stays independently editable afterward. No iService
+    // change needed: it fetches two pages iService already serves — the
+    // Playlists page (to list existing instances of the target plugin) and
+    // that instance's own settings page (to read its stored settings) — and
+    // reuses the same fetch-and-parse approach as the settings editor above.
+
+    let playlistPagePromise = null;
+    function fetchPlaylistPage() {
+        if (!playlistPagePromise) {
+            playlistPagePromise = fetch('/playlist')
+                .then(resp => (resp.ok ? resp.text() : null))
+                .then(html => (html ? new DOMParser().parseFromString(html, 'text/html') : null))
+                .catch(() => null);
+        }
+        return playlistPagePromise;
+    }
+
+    async function listExistingInstances(pluginId) {
+        const doc = await fetchPlaylistPage();
+        if (!doc || !pluginId) return [];
+        return Array.from(doc.querySelectorAll('.plugin-item'))
+            .filter(el => el.dataset.pluginId === pluginId && el.dataset.instanceName)
+            .map(el => {
+                const playlistEl = el.closest('[data-playlist-name]');
+                return {
+                    instanceName: el.dataset.instanceName,
+                    instanceLabel: el.dataset.instanceLabel || el.dataset.instanceName,
+                    playlistName: playlistEl ? playlistEl.dataset.playlistName : '',
+                };
+            });
+    }
+
+    const regionCloneToken = new Map(); // uid -> token, guards against a slow /playlist fetch landing late
+    async function refreshCloneOptions(region) {
+        const uid = uidFor(region);
+        const token = (regionCloneToken.get(uid) || 0) + 1;
+        regionCloneToken.set(uid, token);
+
+        const options = region.plugin_id ? await listExistingInstances(region.plugin_id) : [];
+        if (regionCloneToken.get(uid) !== token) return; // superseded
+
+        const select = container.querySelector(`.layout-clone-select[data-uid="${uid}"]`);
+        if (!select) return;
+        select.innerHTML = '<option value="">— choose —</option>';
+        options.forEach(opt => {
+            const o = document.createElement('option');
+            o.value = opt.instanceName;
+            o.textContent = opt.playlistName ? `${opt.instanceLabel} — ${opt.playlistName}` : opt.instanceLabel;
+            select.appendChild(o);
+        });
+    }
+
+    // Finds the JSON object immediately following `marker` in `text` by
+    // brace-matching (string/escape aware) rather than a regex, since the
+    // settings values themselves could legitimately contain "};" or nested
+    // braces that would truncate a naive non-greedy regex match.
+    function extractJsonAfterMarker(text, marker) {
+        const idx = text.indexOf(marker);
+        if (idx === -1) return null;
+        let i = idx + marker.length;
+        while (i < text.length && /\s/.test(text[i])) i++;
+        if (text[i] !== '{') return null;
+        const start = i;
+        let depth = 0;
+        let inString = false;
+        let stringChar = '';
+        let escaped = false;
+        for (; i < text.length; i++) {
+            const ch = text[i];
+            if (inString) {
+                if (escaped) escaped = false;
+                else if (ch === '\\') escaped = true;
+                else if (ch === stringChar) inString = false;
+                continue;
+            }
+            if (ch === '"' || ch === "'") { inString = true; stringChar = ch; continue; }
+            if (ch === '{') depth++;
+            else if (ch === '}') {
+                depth--;
+                if (depth === 0) return text.slice(start, i + 1);
+            }
+        }
+        return null;
+    }
+
+    // Every /plugin/<id> page embeds `window.pluginSettings = {...}` — the
+    // real, already-resolved settings dict for whatever instance the page
+    // was requested with (or {} for a fresh draft) — regardless of whether
+    // that plugin has a schema. Reading this directly is simpler and more
+    // exact than reconstructing values field-by-field the way the settings
+    // editor above does, and it's the only way to recover a non-schema
+    // plugin's (e.g. blood_sugar) settings at all.
+    function extractPluginSettingsFromDoc(doc) {
+        const marker = 'window.pluginSettings =';
+        for (const script of Array.from(doc.querySelectorAll('script'))) {
+            const text = script.textContent || '';
+            if (!text.includes(marker)) continue;
+            const jsonStr = extractJsonAfterMarker(text, marker);
+            if (!jsonStr) continue;
+            try {
+                return JSON.parse(jsonStr);
+            } catch (err) {
+                // keep looking — plugin.html has more than one inline <script>
+            }
+        }
+        return null;
+    }
+
+    // Generic style/frame/margin/background settings every plugin's *full*
+    // settings page exposes via its own "Style" tab (plugin.html, outside
+    // any [data-settings-schema] content — a region's rendered form never
+    // shows these, so nothing here can ever manage them once cloned in) are
+    // meant for a full-screen rendering, not a cropped region — HOME_PRESET's
+    // own region settings never include them. Strip them so a clone doesn't
+    // silently import an unmanaged frame border/margin/background into a
+    // region via the Advanced JSON box.
+    const STYLE_SETTING_KEYS = [
+        'selectedFrame', 'topMargin', 'bottomMargin', 'leftMargin', 'rightMargin',
+        'backgroundOption', 'backgroundColor', 'backgroundImageFile', 'textColor',
+    ];
+    function stripStyleSettings(settings) {
+        const result = {};
+        Object.keys(settings || {}).forEach(key => {
+            if (!STYLE_SETTING_KEYS.includes(key)) result[key] = settings[key];
+        });
+        return result;
+    }
+
+    async function fetchInstanceSettings(pluginId, instanceName) {
+        try {
+            const resp = await fetch(`/plugin/${encodeURIComponent(pluginId)}?instance=${encodeURIComponent(instanceName)}`);
+            if (!resp.ok) return null;
+            const doc = new DOMParser().parseFromString(await resp.text(), 'text/html');
+            const settings = extractPluginSettingsFromDoc(doc);
+            return settings ? stripStyleSettings(settings) : settings;
+        } catch (err) {
+            return null;
+        }
+    }
+
     function clampInt(value, min, max) {
         return Math.max(min, Math.min(max, Math.round(value)));
     }
@@ -458,6 +632,14 @@ document.addEventListener('DOMContentLoaded', () => {
             width: (w / CANVAS_W * 100) + '%',
             height: (h / CANVAS_H * 100) + '%',
         };
+    }
+
+    // H×W as a percentage of the canvas, e.g. "25% × 40%" for a region a
+    // quarter of the canvas tall and two-fifths wide.
+    function percentLabelText(region) {
+        const hPct = Math.round((region.h / CANVAS_H) * 100);
+        const wPct = Math.round((region.w / CANVAS_W) * 100);
+        return `${hPct}% × ${wPct}%`;
     }
 
     // Updates one region's canvas box position/size/label and its X/Y/W/H
@@ -476,6 +658,8 @@ document.addEventListener('DOMContentLoaded', () => {
             box.style.height = style.height;
             const label = box.querySelector('.layout-canvas-label');
             if (label) label.textContent = region.plugin_id || `Region ${index + 1}`;
+            const percentEl = box.querySelector('.layout-canvas-percent');
+            if (percentEl) percentEl.textContent = percentLabelText(region);
         }
 
         container.querySelectorAll(`.layout-field[data-index="${index}"]`).forEach(input => {
@@ -503,6 +687,12 @@ document.addEventListener('DOMContentLoaded', () => {
             label.style.cssText = `font-size:11px; padding:2px 4px; color:#fff; background:${color}; display:inline-block; max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; pointer-events:none;`;
             box.appendChild(label);
 
+            const percentEl = document.createElement('div');
+            percentEl.className = 'layout-canvas-percent';
+            percentEl.textContent = percentLabelText(region);
+            percentEl.style.cssText = `font-size:10px; padding:1px 4px; margin-left:6px; color:#fff; background:${color}; opacity:0.85; display:inline-block; max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; pointer-events:none;`;
+            box.appendChild(percentEl);
+
             const handle = document.createElement('div');
             handle.className = 'layout-canvas-resize-handle';
             handle.title = 'Drag to resize';
@@ -517,6 +707,33 @@ document.addEventListener('DOMContentLoaded', () => {
 
             canvasEl.appendChild(box);
         });
+    }
+
+    function rectsOverlap(a, b) {
+        return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+    }
+
+    // Free-hand pointer dragging rarely lands on the exact canvas-unit value
+    // where a region's edge would perfectly touch the canvas boundary or
+    // another region's edge — fast mouse movement can jump straight past
+    // that exact value between two pointermove events, and the overlap
+    // check below then rejects the overshoot, leaving the region a unit or
+    // two short of "flush." Snapping candidates within a small threshold to
+    // the nearest real edge (canvas bounds or any other region's edge) lets
+    // users reliably reach exact, gap-free placement via drag.
+    const SNAP_THRESHOLD = Math.max(2, Math.round(Math.min(CANVAS_W, CANVAS_H) * 0.015));
+    function snapToEdges(candidate, targets, min, max) {
+        let best = candidate;
+        let bestDist = SNAP_THRESHOLD;
+        targets.forEach(t => {
+            if (t < min || t > max) return;
+            const dist = Math.abs(candidate - t);
+            if (dist <= bestDist) {
+                bestDist = dist;
+                best = t;
+            }
+        });
+        return best;
     }
 
     // Drags (mode 'move') or resizes (mode 'resize') region `index` on the
@@ -537,15 +754,67 @@ document.addEventListener('DOMContentLoaded', () => {
         const target = e.currentTarget;
         target.setPointerCapture(e.pointerId);
 
+        // Regions this one already overlapped *before* this gesture started
+        // (e.g. a saved config from before overlap-prevention existed, or
+        // any other pre-existing imprecision) are exempt from the check
+        // below for the rest of this drag — otherwise a region that starts
+        // out overlapping something could never be dragged again at all,
+        // not even away from the overlap.
+        const preExistingOverlaps = new Set(
+            regions.filter(r => r !== region && rectsOverlap(start, { x: r.x, y: r.y, w: r.w, h: r.h }))
+        );
+        function blockingOverlap(x, y, w, h) {
+            const candidate = { x, y, w, h };
+            return regions.some(r => r !== region && !preExistingOverlaps.has(r) && rectsOverlap(candidate, { x: r.x, y: r.y, w: r.w, h: r.h }));
+        }
+
+        // Each axis is checked independently (using the other axis's
+        // *current*, not candidate, value) so dragging diagonally toward
+        // another region still slides smoothly along whichever axis isn't
+        // blocked, instead of freezing both the instant either one touches.
         function onMove(ev) {
             const dx = (ev.clientX - startClientX) * scaleX;
             const dy = (ev.clientY - startClientY) * scaleY;
             if (mode === 'move') {
-                region.x = clampInt(start.x + dx, 0, Math.max(0, CANVAS_W - region.w));
-                region.y = clampInt(start.y + dy, 0, Math.max(0, CANVAS_H - region.h));
+                const maxX = Math.max(0, CANVAS_W - region.w);
+                const maxY = Math.max(0, CANVAS_H - region.h);
+                const xTargets = [0, maxX];
+                const yTargets = [0, maxY];
+                regions.forEach(r => {
+                    if (r === region) return;
+                    xTargets.push(r.x - region.w, r.x + r.w); // this region's right edge on r's left, or left edge on r's right
+                    yTargets.push(r.y - region.h, r.y + r.h);
+                });
+                let candidateX = clampInt(start.x + dx, 0, maxX);
+                let candidateY = clampInt(start.y + dy, 0, maxY);
+                candidateX = snapToEdges(candidateX, xTargets, 0, maxX);
+                candidateY = snapToEdges(candidateY, yTargets, 0, maxY);
+                if (!blockingOverlap(candidateX, region.y, region.w, region.h)) {
+                    region.x = candidateX;
+                }
+                if (!blockingOverlap(region.x, candidateY, region.w, region.h)) {
+                    region.y = candidateY;
+                }
             } else {
-                region.w = clampInt(start.w + dx, 1, CANVAS_W - region.x);
-                region.h = clampInt(start.h + dy, 1, CANVAS_H - region.y);
+                const maxW = CANVAS_W - region.x;
+                const maxH = CANVAS_H - region.y;
+                const wTargets = [maxW];
+                const hTargets = [maxH];
+                regions.forEach(r => {
+                    if (r === region) return;
+                    wTargets.push(r.x - region.x); // this region's right edge on r's left edge
+                    hTargets.push(r.y - region.y); // this region's bottom edge on r's top edge
+                });
+                let candidateW = clampInt(start.w + dx, 1, maxW);
+                let candidateH = clampInt(start.h + dy, 1, maxH);
+                candidateW = snapToEdges(candidateW, wTargets, 1, maxW);
+                candidateH = snapToEdges(candidateH, hTargets, 1, maxH);
+                if (!blockingOverlap(region.x, region.y, candidateW, region.h)) {
+                    region.w = candidateW;
+                }
+                if (!blockingOverlap(region.x, region.y, region.w, candidateH)) {
+                    region.h = candidateH;
+                }
             }
             updateCanvasBox(index);
             sync();

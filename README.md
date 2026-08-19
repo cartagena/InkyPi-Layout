@@ -1,8 +1,8 @@
 # InkyPi-Layout
 
-Composes multiple existing InkyPi plugins into named rectangular regions on one screen, so a single display refresh can show, e.g., weather + blood glucose + a calendar agenda + a menu strip together.
+Composes multiple existing InkyPi plugins into named rectangular regions on one screen, so a single display refresh can show, e.g., a comic strip + a countdown + your task list together.
 
-![Layout plugin compositing weather, blood_sugar, calendar, and nutrislice regions onto one 800x480 canvas](docs/screenshot.png)
+![Rendered Layout screen with a comic/trivia region top-left, a New Year's countdown top-right, and a full-width Tasks region along the bottom](docs/preview.png)
 
 ## How it works
 
@@ -38,7 +38,11 @@ Regions are stored as a single JSON array (`regionsJson`). Each region:
 }
 ```
 
-The settings page lets you add/remove regions and pick each region's plugin from a dropdown. Each region's `settings` are edited as that plugin's own real settings form — the same fields, labels, and show/hide behavior as the plugin's normal settings page, fetched and displayed inline per region — rather than hand-typed JSON. Two regions can target the same plugin independently; each gets its own copy of the form. A plugin whose settings include a rich picker (e.g. weather's map picker, calendar's calendar-URL list) gets everything else as real fields, with just that picker's own settings collapsed into a small "Advanced settings (JSON)" box scoped to those specific keys. A plugin with no settings form at all falls back to a single raw JSON textarea for the whole region, as before. Each region also gets a labeled, colored box on a visual canvas — sized to your device's real, orientation-adjusted resolution when the settings page has that context available, falling back to 800×480 otherwise — that you can drag to move and drag by its bottom-right corner to resize; the `x`/`y`/`w`/`h` number inputs stay next to it, in sync in both directions, for precise or keyboard-only editing. Regions must not exceed the canvas — this is validated both client-side and, authoritatively, against the actual configured display resolution inside `generate_image()`.
+![Region editor canvas with three regions — comic (top-left), countdown (top-right), and todo_list (full-width bottom) — each labeled with its plugin name and height/width as a percentage of the canvas](docs/plugin_config.png)
+
+The settings page lets you add/remove regions and pick each region's plugin from a dropdown. Each region's `settings` are edited as that plugin's own real settings form — the same fields, labels, and show/hide behavior as the plugin's normal settings page, fetched and displayed inline per region — rather than hand-typed JSON. Two regions can target the same plugin independently; each gets its own copy of the form. A plugin whose settings include a rich picker (e.g. weather's map picker, calendar's calendar-URL list) gets everything else as real fields, with just that picker's own settings collapsed into a small "Advanced settings (JSON)" box scoped to those specific keys. A plugin with no settings form at all falls back to a single raw JSON textarea for the whole region, as before.
+
+Each region also has a **"Start from existing instance"** dropdown, listing that plugin's instances already configured anywhere (any playlist, any other region) — picking one copies that instance's settings into the region as a starting point, so a config you've already built once doesn't need retyping. It's a one-time copy, not a live link: the region stays independently editable afterward, and later edits to either side don't affect the other. Generic style settings (frame, margins, background, text color) aren't copied — those apply to a full-screen rendering and aren't part of what a region's own settings form manages. Each region also gets a labeled, colored box on a visual canvas — sized to your device's real, orientation-adjusted resolution when the settings page has that context available, falling back to 800×480 otherwise — that you can drag to move and drag by its bottom-right corner to resize; the `x`/`y`/`w`/`h` number inputs stay next to it, in sync in both directions, for precise or keyboard-only editing. Regions must not exceed the canvas — this is validated both client-side and, authoritatively, against the actual configured display resolution inside `generate_image()`.
 
 | Setting | Description |
 | --- | --- |
