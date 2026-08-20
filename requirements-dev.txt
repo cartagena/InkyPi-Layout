@@ -1,0 +1,8 @@
+# Test-only dependencies for the unit suite (tests/unit), which runs without
+# InkyPi. pillow is here because layout.py imports PIL directly — it composites
+# child plugin output itself rather than going through the host's renderer.
+#
+# The integration suite (tests/integration) installs InkyPi's own requirements
+# instead; see the Testing section of README.md.
+pytest>=8.0,<10
+pillow>=11.0,<13

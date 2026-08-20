@@ -1,0 +1,131 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Weekly, so drift in InkyPi itself is caught even when this repo is quiet —
+  # that's the main thing the integration job is watching for.
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      inkypi_ref:
+        description: "InkyPi ref to test against (branch, tag, or SHA)"
+        required: false
+        default: main
+
+permissions:
+  contents: read
+
+env:
+  # The fork this plugin targets. Upstream fatihak/InkyPi is not supported.
+  INKYPI_REPO: jtn0123/InkyPi
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/ruff-action@v3
+        with:
+          # Pinned, not "latest". ruff's built-in default rule set widened in
+          # 0.16 and turned CI red on unchanged code; an unpinned linter makes
+          # a green PR go red for reasons that have nothing to do with the PR.
+          # Bump this deliberately, with the fixes in the same commit.
+          version: "0.16.4"
+          # No --isolated: ruff.toml in the repo root is the source of truth
+          # for which rules apply.
+          args: check
+
+  unit:
+    # The gate for every PR: no InkyPi, no network, no browser. The suite stubs
+    # the host modules (see tests/conftest.py), so this runs from a bare clone.
+    name: unit (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # InkyPi's own supported range.
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - run: pip install -r requirements-dev.txt
+
+      - name: Run unit tests
+        run: pytest tests/unit -v
+
+  integration:
+    # Runs the same plugin against a real InkyPi checkout: the real BasePlugin,
+    # the real plugin registry, and the real headless-Chromium render pipeline.
+    # This is what stops the unit suite's host stubs from drifting silently.
+    name: integration (InkyPi ${{ github.event.inputs.inkypi_ref || 'main' }})
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the plugin
+        uses: actions/checkout@v4
+        with:
+          path: plugin
+
+      - name: Check out InkyPi
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.INKYPI_REPO }}
+          ref: ${{ github.event.inputs.inkypi_ref || 'main' }}
+          path: inkypi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install InkyPi's runtime dependencies
+        # Deliberately not `pip install -r inkypi/install/requirements.txt`:
+        # that pulls the whole app (inky, cysystemd — which needs
+        # libsystemd-dev to build — openai, google-genai) for no benefit here.
+        # This is the minimal set that makes `import plugins.base_plugin`,
+        # `import config`, and the render pipeline work; it's verified by the
+        # "Fail fast if the host cannot be imported" step below, so a future
+        # InkyPi dependency shows up as a clear error rather than as tests
+        # silently falling back to stubs.
+        run: pip install pytest pillow requests flask python-dotenv jsonschema tzdata psutil
+
+      - name: Install the plugin into InkyPi
+        # Mirrors what `inkypi plugin install` does: the folder under
+        # src/plugins/ must be named exactly after the plugin id.
+        run: ln -s "$GITHUB_WORKSPACE/plugin/layout" "$GITHUB_WORKSPACE/inkypi/src/plugins/layout"
+
+      - name: Verify a headless browser is available
+        # InkyPi's screenshot backend looks for chromium /
+        # chromium-headless-shell / google-chrome on PATH. ubuntu-latest ships
+        # Google Chrome preinstalled; fail with a clear message if that changes
+        # rather than letting render tests fail obscurely.
+        run: |
+          command -v chromium || command -v chromium-headless-shell || command -v google-chrome || {
+            echo "::error::No chromium/google-chrome on PATH; the render tests cannot run."
+            exit 1
+          }
+
+      - name: Fail fast if the host cannot be imported
+        working-directory: inkypi/src
+        run: python -c "import plugins.base_plugin.base_plugin, plugins.plugin_registry, config"
+
+      - name: Run integration tests
+        working-directory: plugin
+        env:
+          INKYPI_PATH: ${{ github.workspace }}/inkypi
+        run: pytest tests/integration -v
+
+      - name: Run unit tests against the real host
+        # The same unit suite, unstubbed. If a stub in tests/conftest.py has
+        # drifted from InkyPi's actual behaviour, this is where it surfaces.
+        working-directory: plugin
+        env:
+          INKYPI_PATH: ${{ github.workspace }}/inkypi
+        run: pytest tests/unit -v
