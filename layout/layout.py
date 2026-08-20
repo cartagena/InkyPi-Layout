@@ -9,6 +9,7 @@ from typing import Any, cast
 from PIL import Image, ImageDraw
 
 from plugins.base_plugin.base_plugin import BasePlugin
+from plugins.base_plugin.settings_schema import schema, section, widget
 from plugins.plugin_registry import get_plugin_instance
 from utils.app_utils import resolve_path
 
@@ -110,6 +111,21 @@ class Layout(BasePlugin):
             if error:
                 return error
         return None
+
+    def build_settings_schema(self) -> dict[str, object]:
+        # The region editor (canvas, drag/resize, clone-picker, per-region
+        # settings forms) is a bespoke UI that doesn't map onto individual
+        # schema fields — it's wrapped whole as a single widget so this
+        # plugin still participates in the schema-driven settings system
+        # (consistent chrome, discoverability) without changing any of its
+        # own markup/JS. settings.html itself is unchanged; it's now reached
+        # via this widget's `template=` instead of the legacy fallback path.
+        return schema(
+            section(
+                "Regions",
+                widget("layout-regions", template="layout/settings.html"),
+            ),
+        )
 
     def generate_settings_template(self) -> dict[str, object]:
         template_params = super().generate_settings_template()
