@@ -19,32 +19,43 @@ PLUGINS_DIR = resolve_path("plugins")
 
 REQUIRED_REGION_KEYS = ("plugin_id", "x", "y", "w", "h")
 
+# Orphaned region cache files (left behind when a region is moved, resized,
+# reconfigured, or deleted) are swept once their mtime passes this age. Age
+# rather than "not in the current region set" because several Layout playlist
+# instances share one cache directory — set-based pruning would have each
+# instance delete the others' still-live entries on every refresh.
+CACHE_MAX_AGE_DAYS = 14
+
 # Concrete "Home screen" preset used as this plugin's real-world test case.
+#
+# Stored as *fractions of the canvas* (0.0-1.0), not pixels: the settings UI
+# scales them to the device's real resolution when the preset is applied, so
+# the preset lands correctly on any panel size rather than only on 800x480.
 HOME_PRESET = [
-    {"plugin_id": "weather", "x": 0, "y": 0, "w": 800, "h": 60, "settings": {}},
+    {"plugin_id": "weather", "x": 0, "y": 0, "w": 1, "h": 0.125, "settings": {}},
     {
         "plugin_id": "blood_sugar",
         "x": 0,
-        "y": 60,
-        "w": 220,
-        "h": 186,
+        "y": 0.125,
+        "w": 0.275,
+        "h": 0.625,
         "settings": {},
         "refresh_minutes": 15,
     },
     {
         "plugin_id": "calendar",
-        "x": 220,
-        "y": 60,
-        "w": 580,
-        "h": 186,
+        "x": 0.275,
+        "y": 0.125,
+        "w": 0.725,
+        "h": 0.625,
         "settings": {},
     },
     {
         "plugin_id": "nutrislice",
         "x": 0,
-        "y": 246,
-        "w": 800,
-        "h": 60,
+        "y": 0.75,
+        "w": 1,
+        "h": 0.25,
         "settings": {"daysToShow": "1", "showCarbs": "true"},
         "refresh_minutes": 240,
     },
@@ -102,12 +113,16 @@ class Layout(BasePlugin):
             regions = self._parse_regions(settings)
         except RuntimeError as e:
             return str(e)
-        # validate_settings has no device_config, so bounds are checked
-        # against this plugin's documented target canvas (800x480).
-        # generate_image() re-validates against the real configured
-        # resolution, which is authoritative.
+        # Only resolution-independent checks belong here: `validate_settings`
+        # has no `device_config` parameter (true of every plugin, not just
+        # Layout), so it cannot know the real canvas size. An earlier version
+        # bounds-checked against a hardcoded 800x480, which rejected every
+        # otherwise-valid region on any larger panel and made this plugin
+        # unusable there. Bounds are checked authoritatively in
+        # generate_image(), which does have the real resolution, and the
+        # settings page's own canvas validates against it live too.
         for region in regions:
-            error = self._validate_region(region, canvas_width=800, canvas_height=480)
+            error = self._validate_region_shape(region)
             if error:
                 return error
         return None
@@ -160,17 +175,13 @@ class Layout(BasePlugin):
                     f"Plugin '{region['plugin_id']}' is not installed/registered."
                 )
 
-        cache = settings.get("_layout_cache")
-        if not isinstance(cache, dict):
-            cache = {}
-            settings["_layout_cache"] = cache
-
         canvas = Image.new("RGB", (canvas_w, canvas_h), "white")
         draw = ImageDraw.Draw(canvas)
         now = datetime.now(UTC)
+        self._prune_cache_dir(device_config, now)
 
         for index, region in enumerate(regions):
-            region_image = self._render_region(region, index, device_config, cache, now)
+            region_image = self._render_region(region, index, device_config, now)
             canvas.paste(region_image, (region["x"], region["y"]))
             draw.rectangle(
                 [
@@ -197,24 +208,33 @@ class Layout(BasePlugin):
     # full canvas on every call; only the expensive child `generate_image()`
     # call — usually an external API request — is what gets skipped when a
     # region's cache is still fresh.
+    #
+    # The cache is *entirely* on-disk: a PNG per region under
+    # <plugin_image_dir>/layout/, with the file's own mtime as the "cached at"
+    # timestamp. Nothing about it is kept in the `settings` dict. That's not a
+    # style preference — InkyPi runs generate_image() in a subprocess
+    # (INKYPI_PLUGIN_ISOLATION defaults to "process"), so `settings` arrives as
+    # a pickled copy and anything written back into it is discarded when the
+    # child exits. An earlier version stored the cache index in
+    # settings["_layout_cache"], which meant every refresh started with an
+    # empty index: `refresh_minutes` never actually skipped a child call, and
+    # the stale-image fallback below never found an image to fall back to.
 
     def _render_region(
         self,
         region: dict[str, Any],
         index: int,
         device_config: Any,
-        cache: dict[str, Any],
         now: datetime,
     ) -> Image.Image:
         w, h = region["w"], region["h"]
-        cache_key = self._region_cache_key(region, index)
+        cache_path = self._region_cache_path(region, index, device_config)
         refresh_minutes = region.get("refresh_minutes")
-        cached_entry = cache.get(cache_key)
 
-        if refresh_minutes and cached_entry:
-            cached_at = self._parse_iso(cached_entry.get("cached_at"))
+        if refresh_minutes and cache_path:
+            cached_at = self._cache_timestamp(cache_path)
             if cached_at and now - cached_at < timedelta(minutes=refresh_minutes):
-                cached_image = self._load_cached_image(cached_entry, w, h)
+                cached_image = self._load_cached_image(cache_path, w, h)
                 if cached_image is not None:
                     return cached_image
 
@@ -230,9 +250,7 @@ class Layout(BasePlugin):
             # Prefer a stale cached image over a blank error box — the rest
             # of the composite is still useful even if one region's data
             # source is temporarily unavailable.
-            fallback = (
-                self._load_cached_image(cached_entry, w, h) if cached_entry else None
-            )
+            fallback = self._load_cached_image(cache_path, w, h)
             if fallback is not None:
                 logger.warning(
                     "Layout region %d ('%s') reusing stale cached image after "
@@ -252,7 +270,7 @@ class Layout(BasePlugin):
             )
             image = image.resize((w, h))
 
-        self._store_cache(cache, cache_key, image, now, device_config)
+        self._store_cache(cache_path, image)
         return image
 
     def _call_child_plugin(
@@ -295,35 +313,40 @@ class Layout(BasePlugin):
             return None
         return os.path.join(base, "layout")
 
-    def _store_cache(
-        self,
-        cache: dict[str, Any],
-        cache_key: str,
-        image: Image.Image,
-        now: datetime,
-        device_config: Any,
-    ) -> None:
+    def _region_cache_path(
+        self, region: dict[str, Any], index: int, device_config: Any
+    ) -> str | None:
         cache_dir = self._cache_dir(device_config)
         if cache_dir is None:
+            return None
+        return os.path.join(cache_dir, f"{self._region_cache_key(region, index)}.png")
+
+    @staticmethod
+    def _store_cache(cache_path: str | None, image: Image.Image) -> None:
+        if cache_path is None:
             return
         try:
-            os.makedirs(cache_dir, exist_ok=True)
-            path = os.path.join(cache_dir, f"{cache_key}.png")
-            image.save(path, format="PNG")
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            image.save(cache_path, format="PNG")
         except OSError as e:
             logger.warning("Layout: failed to write region cache file: %s", e)
-            return
-        cache[cache_key] = {"cached_at": now.isoformat(), "path": path}
+
+    @staticmethod
+    def _cache_timestamp(cache_path: str) -> datetime | None:
+        """Return when *cache_path* was last written, as an aware UTC datetime."""
+        try:
+            return datetime.fromtimestamp(os.path.getmtime(cache_path), UTC)
+        except OSError:
+            return None
 
     @staticmethod
     def _load_cached_image(
-        cached_entry: dict[str, Any] | None, width: int, height: int
+        cache_path: str | None, width: int, height: int
     ) -> Image.Image | None:
-        path = cached_entry.get("path") if cached_entry else None
-        if not path or not os.path.isfile(path):
+        if not cache_path or not os.path.isfile(cache_path):
             return None
         try:
-            with Image.open(path) as cached:
+            with Image.open(cache_path) as cached:
                 cached.load()
                 if cached.size != (width, height):
                     return None
@@ -331,21 +354,53 @@ class Layout(BasePlugin):
         except Exception:
             return None
 
-    @staticmethod
-    def _parse_iso(value: Any) -> datetime | None:
-        if not isinstance(value, str):
-            return None
+    def _prune_cache_dir(self, device_config: Any, now: datetime) -> None:
+        """Delete region cache files older than ``CACHE_MAX_AGE_DAYS``.
+
+        Every edit to a region's geometry or settings changes its cache key
+        and so orphans the previous file; without this the cache directory
+        grows for the life of the install. Pruning by age rather than by "not
+        referenced by the regions I just rendered" is deliberate — multiple
+        Layout playlist instances share this one directory, and a
+        set-difference sweep would have each instance delete the others'
+        still-live entries on every refresh.
+        """
+        cache_dir = self._cache_dir(device_config)
+        if cache_dir is None or not os.path.isdir(cache_dir):
+            return
+        cutoff = now - timedelta(days=CACHE_MAX_AGE_DAYS)
         try:
-            return datetime.fromisoformat(value)
-        except ValueError:
-            return None
+            with os.scandir(cache_dir) as entries:
+                for entry in entries:
+                    if not entry.is_file() or not entry.name.endswith(".png"):
+                        continue
+                    cached_at = self._cache_timestamp(entry.path)
+                    if cached_at is None or cached_at >= cutoff:
+                        continue
+                    try:
+                        os.remove(entry.path)
+                    except OSError as e:
+                        logger.warning(
+                            "Layout: failed to prune stale cache file %s: %s",
+                            entry.path,
+                            e,
+                        )
+        except OSError as e:
+            logger.warning("Layout: failed to scan region cache directory: %s", e)
 
     @staticmethod
     def _render_error_placeholder(region: dict[str, Any], message: str) -> Image.Image:
         w, h = region["w"], region["h"]
         image = Image.new("RGB", (w, h), "#f0f0f0")
         draw = ImageDraw.Draw(image)
-        draw.text((6, 6), f"{region['plugin_id']}\nunavailable", fill="black")
+        # The reason goes on the panel as well as in the log: this box is
+        # often the only symptom an operator sees, and "unavailable" alone
+        # doesn't distinguish a missing API key from an upstream outage.
+        draw.text(
+            (6, 6),
+            f"{region['plugin_id']}\nunavailable\n{message[:120]}",
+            fill="black",
+        )
         return image
 
     # ---- region config parsing / validation ----
@@ -403,6 +458,8 @@ class Layout(BasePlugin):
                     raise RuntimeError(
                         f"Region {i} has a non-integer refresh_minutes."
                     ) from e
+                if refresh_minutes < 0:
+                    raise RuntimeError(f"Region {i} has a negative refresh_minutes.")
 
             region_settings = region.get("settings")
             if region_settings is None:
@@ -425,15 +482,25 @@ class Layout(BasePlugin):
         return parsed
 
     @staticmethod
-    def _validate_region(
-        region: dict[str, Any], canvas_width: int, canvas_height: int
-    ) -> str | None:
+    def _validate_region_shape(region: dict[str, Any]) -> str | None:
+        """Checks that hold at any resolution, so `validate_settings` can run them."""
         x, y, w, h = region["x"], region["y"], region["w"], region["h"]
         plugin_id = region["plugin_id"]
         if w <= 0 or h <= 0:
             return f"Region for '{plugin_id}' must have positive width and height."
         if x < 0 or y < 0:
             return f"Region for '{plugin_id}' has a negative x or y."
+        return None
+
+    @classmethod
+    def _validate_region(
+        cls, region: dict[str, Any], canvas_width: int, canvas_height: int
+    ) -> str | None:
+        shape_error = cls._validate_region_shape(region)
+        if shape_error:
+            return shape_error
+        x, y, w, h = region["x"], region["y"], region["w"], region["h"]
+        plugin_id = region["plugin_id"]
         if x + w > canvas_width or y + h > canvas_height:
             return (
                 f"Region for '{plugin_id}' at x={x}, y={y}, w={w}, h={h} exceeds the "

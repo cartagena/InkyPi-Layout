@@ -1093,6 +1093,29 @@ document.addEventListener('DOMContentLoaded', () => {
         sync();
     });
 
+    // Presets are authored in layout.py as fractions of the canvas (0..1)
+    // rather than pixels, so applying one lands correctly on any panel size
+    // instead of only on the 800x480 it happened to be drawn for. Each edge
+    // is converted to pixels first and w/h derived from the *difference*
+    // between converted edges — rounding x and w independently would let
+    // adjacent regions drift a pixel apart, or push the last one past the
+    // canvas edge and straight into a validation error.
+    function scalePreset(preset) {
+        return preset.map(r => {
+            const x = Math.round(r.x * CANVAS_W);
+            const y = Math.round(r.y * CANVAS_H);
+            return {
+                plugin_id: r.plugin_id,
+                x: x,
+                y: y,
+                w: Math.round((r.x + r.w) * CANVAS_W) - x,
+                h: Math.round((r.y + r.h) * CANVAS_H) - y,
+                settings: JSON.parse(JSON.stringify(r.settings || {})),
+                refresh_minutes: (r.refresh_minutes === undefined) ? null : r.refresh_minutes,
+            };
+        });
+    }
+
     presetLabels.forEach(p => {
         const btn = document.createElement('button');
         btn.type = 'button';
@@ -1102,7 +1125,7 @@ document.addEventListener('DOMContentLoaded', () => {
         btn.style.width = 'auto';
         btn.style.padding = '6px 14px';
         btn.addEventListener('click', () => {
-            regions = JSON.parse(JSON.stringify(presets[p.key]));
+            regions = scalePreset(presets[p.key]);
             renderRegions();
             sync();
         });

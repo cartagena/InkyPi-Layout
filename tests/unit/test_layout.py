@@ -5,7 +5,10 @@ Child plugins are always faked here — never call real Dexcom/Nutrislice/
 Weather/Calendar APIs from this file.
 """
 
+import copy
 import json
+import os
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -95,6 +98,20 @@ def _patch_get_plugin_instance() -> Any:
 
 def _plugins_map(*ids: str) -> dict[str, dict[str, str]]:
     return {pid: {"id": pid, "class": "FakeColorPlugin"} for pid in ids}
+
+
+def _as_subprocess_would(settings: dict[str, Any]) -> dict[str, Any]:
+    """Return the settings dict as a plugin subprocess actually receives it.
+
+    InkyPi runs ``generate_image`` in a separate process by default
+    (``INKYPI_PLUGIN_ISOLATION=process``), so the plugin is handed a *pickled
+    copy* of the instance's settings and anything it writes back into that
+    dict dies with the child.  Tests that pass one long-lived dict across
+    several ``generate_image`` calls silently grant Layout a persistence
+    channel production never gives it — deep-copying per call is what the
+    real refresh path does.
+    """
+    return copy.deepcopy(settings)
 
 
 # ---------------------------------------------------------------------------
@@ -223,13 +240,20 @@ def test_generate_image_rejects_self_reference(plugin: Any, tmp_path: Path) -> N
         plugin.generate_image(settings, device_config)
 
 
-def test_validate_settings_rejects_out_of_bounds_region(plugin: Any) -> None:
+def test_validate_settings_rejects_non_positive_size(plugin: Any) -> None:
+    regions = [{"plugin_id": "fake_a", "x": 0, "y": 0, "w": 0, "h": 60, "settings": {}}]
+    error = plugin.validate_settings({"regionsJson": json.dumps(regions)})
+    assert error is not None
+    assert "positive" in error
+
+
+def test_validate_settings_rejects_negative_offset(plugin: Any) -> None:
     regions = [
-        {"plugin_id": "fake_a", "x": 700, "y": 0, "w": 200, "h": 60, "settings": {}}
+        {"plugin_id": "fake_a", "x": -1, "y": 0, "w": 100, "h": 60, "settings": {}}
     ]
     error = plugin.validate_settings({"regionsJson": json.dumps(regions)})
     assert error is not None
-    assert "exceeds the" in error
+    assert "negative" in error
 
 
 def test_validate_settings_accepts_valid_regions(plugin: Any) -> None:
@@ -237,6 +261,36 @@ def test_validate_settings_accepts_valid_regions(plugin: Any) -> None:
         {"plugin_id": "fake_a", "x": 0, "y": 0, "w": 800, "h": 60, "settings": {}}
     ]
     assert plugin.validate_settings({"regionsJson": json.dumps(regions)}) is None
+
+
+def test_validate_settings_does_not_assume_an_800x480_canvas(plugin: Any) -> None:
+    """A full-screen region on a larger panel must still be savable.
+
+    `validate_settings` gets no `device_config`, so it cannot know the real
+    resolution; bounds-checking against a hardcoded default here made the
+    plugin unusable on anything bigger than 800x480.
+    """
+    regions = [
+        {"plugin_id": "fake_a", "x": 0, "y": 0, "w": 1600, "h": 1200, "settings": {}}
+    ]
+    assert plugin.validate_settings({"regionsJson": json.dumps(regions)}) is None
+
+
+def test_validate_settings_rejects_negative_refresh_minutes(plugin: Any) -> None:
+    regions = [
+        {
+            "plugin_id": "fake_a",
+            "x": 0,
+            "y": 0,
+            "w": 100,
+            "h": 60,
+            "settings": {},
+            "refresh_minutes": -5,
+        }
+    ]
+    error = plugin.validate_settings({"regionsJson": json.dumps(regions)})
+    assert error is not None
+    assert "refresh_minutes" in error
 
 
 def test_validate_settings_rejects_invalid_json(plugin: Any) -> None:
@@ -267,10 +321,40 @@ def test_cached_region_skips_child_plugin_within_refresh_window(
     settings = {"regionsJson": json.dumps(regions)}
 
     with _patch_get_plugin_instance():
-        plugin.generate_image(settings, device_config)
-        plugin.generate_image(settings, device_config)
+        plugin.generate_image(_as_subprocess_would(settings), device_config)
+        plugin.generate_image(_as_subprocess_would(settings), device_config)
 
     assert FakeColorPlugin.call_counts["fake_a"] == 1
+    # The cache must survive on disk, not in the settings dict — the dict is
+    # a per-refresh copy in production and cannot carry state forward.
+    assert "_layout_cache" not in settings
+    assert list((tmp_path / "plugin_images" / "layout").glob("*.png"))
+
+
+def test_expired_cache_re_invokes_child_plugin(plugin: Any, tmp_path: Path) -> None:
+    regions = [
+        {
+            "plugin_id": "fake_a",
+            "x": 0,
+            "y": 0,
+            "w": 100,
+            "h": 60,
+            "settings": {},
+            "refresh_minutes": 15,
+        }
+    ]
+    device_config = FakeDeviceConfig(tmp_path, _plugins_map("fake_a"))
+    settings = {"regionsJson": json.dumps(regions)}
+
+    with _patch_get_plugin_instance():
+        plugin.generate_image(_as_subprocess_would(settings), device_config)
+        # Backdate the cache file past its 15-minute window.
+        for cached in (tmp_path / "plugin_images" / "layout").glob("*.png"):
+            old = time.time() - 3600
+            os.utime(cached, (old, old))
+        plugin.generate_image(_as_subprocess_would(settings), device_config)
+
+    assert FakeColorPlugin.call_counts["fake_a"] == 2
 
 
 def test_region_without_refresh_minutes_always_refreshes(
@@ -283,8 +367,8 @@ def test_region_without_refresh_minutes_always_refreshes(
     settings = {"regionsJson": json.dumps(regions)}
 
     with _patch_get_plugin_instance():
-        plugin.generate_image(settings, device_config)
-        plugin.generate_image(settings, device_config)
+        plugin.generate_image(_as_subprocess_would(settings), device_config)
+        plugin.generate_image(_as_subprocess_would(settings), device_config)
 
     assert FakeColorPlugin.call_counts["fake_a"] == 2
 
@@ -307,13 +391,38 @@ def test_child_failure_falls_back_to_stale_cache_instead_of_raising(
     settings = {"regionsJson": json.dumps(regions)}
 
     with _patch_get_plugin_instance():
-        first = plugin.generate_image(settings, device_config)
+        first = plugin.generate_image(_as_subprocess_would(settings), device_config)
         FakeColorPlugin.fail_ids.add("fake_a")
-        second = plugin.generate_image(settings, device_config)
+        second = plugin.generate_image(_as_subprocess_would(settings), device_config)
 
     # Region content (excluding the border) should be identical: the stale
     # cached render was reused rather than a blank error placeholder.
     assert first.getpixel((50, 30)) == second.getpixel((50, 30)) == (255, 0, 0)
+
+
+def test_stale_cache_files_are_pruned(plugin: Any, tmp_path: Path) -> None:
+    from plugins.layout.layout import CACHE_MAX_AGE_DAYS
+
+    regions = [
+        {"plugin_id": "fake_a", "x": 0, "y": 0, "w": 100, "h": 60, "settings": {}}
+    ]
+    device_config = FakeDeviceConfig(tmp_path, _plugins_map("fake_a"))
+    settings = {"regionsJson": json.dumps(regions)}
+    cache_dir = tmp_path / "plugin_images" / "layout"
+    cache_dir.mkdir(parents=True)
+
+    # An orphan left behind by a region that was since moved or deleted.
+    orphan = cache_dir / "9_gone_deadbeef00.png"
+    Image.new("RGB", (10, 10), "white").save(orphan)
+    expired = time.time() - (CACHE_MAX_AGE_DAYS + 1) * 86400
+    os.utime(orphan, (expired, expired))
+
+    with _patch_get_plugin_instance():
+        plugin.generate_image(_as_subprocess_would(settings), device_config)
+
+    assert not orphan.exists()
+    # The region rendered this pass keeps its own fresh cache file.
+    assert list(cache_dir.glob("*.png"))
 
 
 def test_child_failure_without_cache_renders_placeholder_not_raise(
@@ -418,3 +527,21 @@ def test_generate_settings_template_lists_available_plugins_and_presets(
     presets = json.loads(template_params["presets_json"])
     assert "home" in presets
     assert len(presets["home"]) == 4
+
+
+def test_presets_are_expressed_as_canvas_fractions(plugin: Any) -> None:
+    """Presets must be resolution-independent.
+
+    The settings UI multiplies these by the device's real canvas size, so a
+    pixel-valued preset would only ever be correct on one panel — and would
+    fail validation outright on a smaller one.
+    """
+    presets = json.loads(plugin.generate_settings_template()["presets_json"])
+    for regions in presets.values():
+        for region in regions:
+            for key in ("x", "y", "w", "h"):
+                assert (
+                    0 <= region[key] <= 1
+                ), f"{region['plugin_id']}.{key} not a fraction"
+            assert region["x"] + region["w"] <= 1
+            assert region["y"] + region["h"] <= 1
