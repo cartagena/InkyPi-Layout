@@ -2,6 +2,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
@@ -305,7 +306,12 @@ class Layout(BasePlugin):
         digest = hashlib.sha1(
             payload.encode("utf-8"), usedforsecurity=False
         ).hexdigest()[:10]
-        return f"{index}_{region['plugin_id']}_{digest}"
+        # The digest alone identifies the region; plugin_id is in the filename
+        # purely so the cache directory is readable. Strip it to the characters
+        # InkyPi's own plugin-id pattern allows anyway, so a hand-edited
+        # regionsJson can never steer this into a path outside the cache dir.
+        safe_plugin_id = re.sub(r"[^A-Za-z0-9_]", "", region["plugin_id"])[:40]
+        return f"{index}_{safe_plugin_id}_{digest}"
 
     def _cache_dir(self, device_config: Any) -> str | None:
         base = getattr(device_config, "plugin_image_dir", None)
