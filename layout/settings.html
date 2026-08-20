@@ -257,7 +257,7 @@ document.addEventListener('DOMContentLoaded', () => {
         containerEl.appendChild(textarea);
     }
 
-    // Widget types verified safe to run for real, per-region, via iService's
+    // Widget types verified safe to run for real, per-region, via InkyPi's
     // InkyPiPluginSchema.initWidgetsIn (root-scoped, no shared global state,
     // seed correctly from a passed-in settings dict, fixed/non-growing input
     // count so there's no dynamic-row namespacing gap). Grows as more widget
@@ -712,8 +712,8 @@ document.addEventListener('DOMContentLoaded', () => {
     // Lets a region start from a plugin instance that's already configured
     // elsewhere (another playlist, another region) instead of being
     // configured from scratch — a one-time copy into region.settings, not a
-    // live link, so it stays independently editable afterward. No iService
-    // change needed: it fetches two pages iService already serves — the
+    // live link, so it stays independently editable afterward. No InkyPi-side
+    // change needed: it fetches two pages InkyPi already serves — the
     // Playlists page (to list existing instances of the target plugin) and
     // that instance's own settings page (to read its stored settings) — and
     // reuses the same fetch-and-parse approach as the settings editor above.
