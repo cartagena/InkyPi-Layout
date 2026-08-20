@@ -17,7 +17,8 @@ For each configured region, Layout looks up the target plugin by `plugin_id`, ca
 - Any combination of installed plugins (built-in or third-party) can be assigned to any region
 - Per-region optional `refresh_minutes` caches a region's rendered image so its plugin isn't invoked (and doesn't hit its upstream API) on every refresh — useful when one region needs fresher data than another
 - If a region's plugin fails at render time (e.g. an upstream API outage), Layout falls back to that region's last successfully cached image rather than failing the whole screen
-- A built-in "Home screen" preset pre-fills a concrete 4-region layout; the underlying mechanism supports arbitrary regions
+- A built-in "Home screen" preset pre-fills a concrete 4-region layout, scaled to your display's own resolution; the underlying mechanism supports arbitrary regions
+- Works at any display resolution — regions are validated against your device's actual, orientation-adjusted canvas size
 
 ## Installation
 

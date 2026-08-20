@@ -27,31 +27,35 @@ REQUIRED_REGION_KEYS = ("plugin_id", "x", "y", "w", "h")
 CACHE_MAX_AGE_DAYS = 14
 
 # Concrete "Home screen" preset used as this plugin's real-world test case.
+#
+# Stored as *fractions of the canvas* (0.0-1.0), not pixels: the settings UI
+# scales them to the device's real resolution when the preset is applied, so
+# the preset lands correctly on any panel size rather than only on 800x480.
 HOME_PRESET = [
-    {"plugin_id": "weather", "x": 0, "y": 0, "w": 800, "h": 60, "settings": {}},
+    {"plugin_id": "weather", "x": 0, "y": 0, "w": 1, "h": 0.125, "settings": {}},
     {
         "plugin_id": "blood_sugar",
         "x": 0,
-        "y": 60,
-        "w": 220,
-        "h": 186,
+        "y": 0.125,
+        "w": 0.275,
+        "h": 0.625,
         "settings": {},
         "refresh_minutes": 15,
     },
     {
         "plugin_id": "calendar",
-        "x": 220,
-        "y": 60,
-        "w": 580,
-        "h": 186,
+        "x": 0.275,
+        "y": 0.125,
+        "w": 0.725,
+        "h": 0.625,
         "settings": {},
     },
     {
         "plugin_id": "nutrislice",
         "x": 0,
-        "y": 246,
-        "w": 800,
-        "h": 60,
+        "y": 0.75,
+        "w": 1,
+        "h": 0.25,
         "settings": {"daysToShow": "1", "showCarbs": "true"},
         "refresh_minutes": 240,
     },
@@ -109,12 +113,16 @@ class Layout(BasePlugin):
             regions = self._parse_regions(settings)
         except RuntimeError as e:
             return str(e)
-        # validate_settings has no device_config, so bounds are checked
-        # against this plugin's documented target canvas (800x480).
-        # generate_image() re-validates against the real configured
-        # resolution, which is authoritative.
+        # Only resolution-independent checks belong here: `validate_settings`
+        # has no `device_config` parameter (true of every plugin, not just
+        # Layout), so it cannot know the real canvas size. An earlier version
+        # bounds-checked against a hardcoded 800x480, which rejected every
+        # otherwise-valid region on any larger panel and made this plugin
+        # unusable there. Bounds are checked authoritatively in
+        # generate_image(), which does have the real resolution, and the
+        # settings page's own canvas validates against it live too.
         for region in regions:
-            error = self._validate_region(region, canvas_width=800, canvas_height=480)
+            error = self._validate_region_shape(region)
             if error:
                 return error
         return None
@@ -474,15 +482,25 @@ class Layout(BasePlugin):
         return parsed
 
     @staticmethod
-    def _validate_region(
-        region: dict[str, Any], canvas_width: int, canvas_height: int
-    ) -> str | None:
+    def _validate_region_shape(region: dict[str, Any]) -> str | None:
+        """Checks that hold at any resolution, so `validate_settings` can run them."""
         x, y, w, h = region["x"], region["y"], region["w"], region["h"]
         plugin_id = region["plugin_id"]
         if w <= 0 or h <= 0:
             return f"Region for '{plugin_id}' must have positive width and height."
         if x < 0 or y < 0:
             return f"Region for '{plugin_id}' has a negative x or y."
+        return None
+
+    @classmethod
+    def _validate_region(
+        cls, region: dict[str, Any], canvas_width: int, canvas_height: int
+    ) -> str | None:
+        shape_error = cls._validate_region_shape(region)
+        if shape_error:
+            return shape_error
+        x, y, w, h = region["x"], region["y"], region["w"], region["h"]
+        plugin_id = region["plugin_id"]
         if x + w > canvas_width or y + h > canvas_height:
             return (
                 f"Region for '{plugin_id}' at x={x}, y={y}, w={w}, h={h} exceeds the "
