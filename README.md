@@ -56,6 +56,8 @@ Each region also has a **"Start from existing instance"** dropdown, listing that
 
 The per-region `refresh_minutes` cache only reduces how often *child plugins* hit their own upstream APIs. It does **not** reduce how often the physical e-paper panel refreshes — that's controlled by this Layout instance's own playlist refresh interval, which you're responsible for setting appropriately (e.g. to your fastest region's needs).
 
+Cached region renders are stored as PNG files under InkyPi's plugin image directory (`<plugin_image_dir>/layout/`), with each file's own modification time serving as its "cached at" timestamp. Files left behind by regions you've since moved, resized, reconfigured, or deleted are swept automatically once they're 14 days old.
+
 ## Testing
 
 Two suites, split by what they need. **Child plugins are faked in the unit suite and restricted to network-free built-ins (`clock`, `year_progress`) in the integration suite** — running the tests never contacts a third-party API.
