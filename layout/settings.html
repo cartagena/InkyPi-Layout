@@ -61,9 +61,19 @@ document.addEventListener('DOMContentLoaded', () => {
 
     let regions = [];
 
+    // display_name/id come from each installed plugin's own plugin-info.json,
+    // i.e. from third-party files on disk rather than from this app — escape
+    // them rather than trusting an installed plugin not to put markup in its
+    // own display name.
+    function escapeHtml(value) {
+        return String(value == null ? '' : value).replace(/[&<>"']/g, c => (
+            { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+        ));
+    }
+
     function pluginOptionsHtml(selected) {
         return availablePlugins.map(p =>
-            `<option value="${p.id}" ${p.id === selected ? 'selected' : ''}>${p.display_name}</option>`
+            `<option value="${escapeHtml(p.id)}" ${p.id === selected ? 'selected' : ''}>${escapeHtml(p.display_name)}</option>`
         ).join('');
     }
 
