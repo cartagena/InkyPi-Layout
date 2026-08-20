@@ -368,14 +368,52 @@ def test_mismatched_child_image_size_gets_resized(plugin: Any, tmp_path: Path) -
 # ---------------------------------------------------------------------------
 
 
+def _write_fake_plugins_dir(root: Path) -> Path:
+    """Build a plugins/ directory shaped like InkyPi's, for _list_available_plugins.
+
+    Patched in rather than read from whatever InkyPi checkout happens to be
+    present, so this test asserts the same thing in the standalone and
+    inside-InkyPi environments.
+    """
+    plugins_dir = root / "plugins"
+    for plugin_id, display_name in (
+        ("weather", "Weather"),
+        ("calendar", "Calendar"),
+        ("layout", "Layout"),
+    ):
+        directory = plugins_dir / plugin_id
+        directory.mkdir(parents=True)
+        (directory / "plugin-info.json").write_text(
+            json.dumps({"id": plugin_id, "display_name": display_name})
+        )
+    # base_plugin is excluded by name; a stray directory with no
+    # plugin-info.json must be skipped rather than crash the scan.
+    (plugins_dir / "base_plugin").mkdir()
+    (plugins_dir / "not_a_plugin").mkdir()
+    return plugins_dir
+
+
 def test_generate_settings_template_lists_available_plugins_and_presets(
-    plugin: Any,
+    plugin: Any, tmp_path: Path
 ) -> None:
-    template_params = plugin.generate_settings_template()
-    assert "available_plugins" in template_params
+    plugins_dir = _write_fake_plugins_dir(tmp_path)
+
+    with patch("plugins.layout.layout.PLUGINS_DIR", str(plugins_dir)):
+        template_params = plugin.generate_settings_template()
+
     ids = {p["id"] for p in template_params["available_plugins"]}
-    # "layout" must not offer itself as a region target.
+    assert ids == {"weather", "calendar"}
+    # "layout" must not offer itself as a region target, and non-plugin
+    # directories must not appear at all.
     assert "layout" not in ids
+    assert "base_plugin" not in ids
+    assert "not_a_plugin" not in ids
+    # Sorted by display name for a stable dropdown order.
+    assert [p["display_name"] for p in template_params["available_plugins"]] == [
+        "Calendar",
+        "Weather",
+    ]
+
     assert "presets_json" in template_params
     presets = json.loads(template_params["presets_json"])
     assert "home" in presets

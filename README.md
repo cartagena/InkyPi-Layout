@@ -56,6 +56,37 @@ Each region also has a **"Start from existing instance"** dropdown, listing that
 
 The per-region `refresh_minutes` cache only reduces how often *child plugins* hit their own upstream APIs. It does **not** reduce how often the physical e-paper panel refreshes — that's controlled by this Layout instance's own playlist refresh interval, which you're responsible for setting appropriately (e.g. to your fastest region's needs).
 
+## Testing
+
+Two suites, split by what they need. **Child plugins are faked in the unit suite and restricted to network-free built-ins (`clock`, `year_progress`) in the integration suite** — running the tests never contacts a third-party API.
+
+### Unit tests — run anywhere
+
+No InkyPi, no network, no browser. From a bare clone:
+
+```bash
+pip install -r requirements-dev.txt
+pytest tests/unit
+```
+
+Covers pixel-accurate region placement, region borders, every validation error, per-region `refresh_minutes` caching (fresh hit, expiry, no-`refresh_minutes`), stale-cache pruning, stale-cache fallback on a child failure, placeholder rendering, child-image auto-resize, and the settings template's plugin listing and preset output.
+
+Layout composites with PIL directly rather than going through the host's renderer, so its entire suite runs standalone — `tests/conftest.py` only needs to stand in for `BasePlugin`, the settings-schema DSL, the plugin registry, and `resolve_path`.
+
+### Integration tests — need a real InkyPi checkout
+
+Runs against the real `BasePlugin`, the real plugin registry, and real installed child plugins actually rendering through headless Chromium into one composite.
+
+```bash
+git clone https://github.com/jtn0123/InkyPi ../InkyPi
+ln -s "$PWD/layout" ../InkyPi/src/plugins/layout
+INKYPI_PATH=../InkyPi pytest tests/integration
+```
+
+Without `INKYPI_PATH` these are skipped, not failed, so a plain `pytest` from a clean clone still exits green having run the unit suite.
+
+CI runs both, plus the *unit* suite a second time with `INKYPI_PATH` set — the same tests unstubbed, so a stub that has drifted from InkyPi's real behavior surfaces as a failure instead of quietly still passing.
+
 ## External API
 
 This plugin makes no API calls of its own — it only calls other installed plugins' `generate_image()`. Whatever external APIs those plugins depend on (their keys, limits, and docs) are unchanged and apply as usual; see each plugin's own README/docs.
