@@ -4,6 +4,10 @@ Composes multiple existing InkyPi plugins into named rectangular regions on one 
 
 ![Rendered Layout screen with a comic/trivia region top-left, a New Year's countdown top-right, and a full-width Tasks region along the bottom](docs/preview.png)
 
+## Compatibility
+
+**Requires [jtn0123/InkyPi](https://github.com/jtn0123/InkyPi). This plugin does not work on upstream [fatihak/InkyPi](https://github.com/fatihak/InkyPi).** Composing other plugins' output requires calling into the host app's internal plugin registry (`plugins.plugin_registry.get_plugin_instance`) to instantiate and invoke them — a capability that exists only in this fork, not upstream. There is no compatibility path for running Layout on the upstream project.
+
 ## How it works
 
 For each configured region, Layout looks up the target plugin by `plugin_id`, calls its own unmodified `generate_image()` — scoped to the region's exact pixel size so the child's own layout logic (font sizes, wrapping) adapts instead of getting cropped — and pastes the result onto the full canvas at `(x, y)`, with a 1px black border for legibility. Child plugins are called as black boxes; none of their code is touched.
@@ -23,7 +27,7 @@ Install the plugin from this GitHub repository:
 inkypi plugin install layout https://github.com/cartagena/InkyPi-Layout
 ```
 
-If you're running a fork of InkyPi rather than the upstream project, check that fork's own documentation — plugin installation and loading steps can differ. This plugin was built and tested against [jtn0123/InkyPi](https://github.com/jtn0123/InkyPi).
+This assumes a [jtn0123/InkyPi](https://github.com/jtn0123/InkyPi) checkout — see [Compatibility](#compatibility) above. If you're on a different fork, check that fork's own documentation, since plugin installation and loading steps can differ; upstream [fatihak/InkyPi](https://github.com/fatihak/InkyPi) isn't supported at all.
 
 ## Configuration
 
