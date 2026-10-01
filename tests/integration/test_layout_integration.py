@@ -128,3 +128,45 @@ def test_composites_real_child_plugins_onto_one_canvas(
     # Both regions rendered something rather than leaving white canvas.
     assert len(image.crop((0, 0, 800, 240)).getcolors(maxcolors=1 << 20)) > 1
     assert len(image.crop((0, 240, 800, 480)).getcolors(maxcolors=1 << 20)) > 1
+
+
+def test_region_cache_survives_a_fresh_settings_dict(
+    layout_plugin: Any, device_config: Any
+) -> None:
+    """The bug the unit suite can only model: caching across process boundaries.
+
+    InkyPi pickles ``settings`` into a subprocess per refresh, so the cache
+    cannot live in that dict. Here the real ``Config``'s real
+    ``plugin_image_dir`` is what has to carry it.
+    """
+    from plugins.plugin_registry import load_plugins
+
+    load_plugins(
+        [
+            {"id": "layout", "class": "Layout"},
+            {"id": "year_progress", "class": "YearProgress"},
+        ]
+    )
+
+    regions = [
+        {
+            "plugin_id": "year_progress",
+            "x": 0, "y": 0, "w": 400, "h": 200,
+            "settings": {},
+            "refresh_minutes": 120,
+        }
+    ]
+    regions_json = json.dumps(regions)
+
+    # A brand-new dict each call, exactly as the refresh subprocess receives it.
+    layout_plugin.generate_image({"regionsJson": regions_json}, device_config)
+    cached = list((__import__("pathlib").Path(device_config.plugin_image_dir) / "layout").glob("*.png"))
+    assert cached, "region render should have been cached to disk"
+
+    first_mtime = cached[0].stat().st_mtime_ns
+    layout_plugin.generate_image({"regionsJson": regions_json}, device_config)
+
+    assert cached[0].stat().st_mtime_ns == first_mtime, (
+        "second refresh re-rendered the region despite refresh_minutes=120; "
+        "the cache is not surviving a fresh settings dict"
+    )
